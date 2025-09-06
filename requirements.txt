@@ -1,0 +1,22 @@
+Django>=5.1
+django-ninja-extra>=0.20.0
+django-ninja>=1.1.0
+uvicorn[standard]>=0.29
+pydantic>=2.6
+openai>=1.40.0
+langgraph>=0.2.0
+httpx>=0.27
+python-dotenv>=1.0.0
+crawl4ai>=0.7.4
+
+# Testing dependencies
+pytest>=7.4.0
+pytest-django>=4.5.0
+pytest-cov>=4.1.0
+pytest-asyncio>=0.21.0
+
+# Add if/when you switch DBs:
+# psycopg[binary]>=3.1
+# supabase>=2.5
+# beautifulsoup4 readability-lxml trafilatura (for crawling/parsing)
+# langfuse>=0.3.0
