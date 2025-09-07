@@ -24,6 +24,7 @@ redis>=5.0.7
 # utils
 numpy>=1.26.4
 django-unfold>=0.60.0
+django-cors-headers>=4.3.1
 
 # Testing dependencies
 pytest>=7.4.0

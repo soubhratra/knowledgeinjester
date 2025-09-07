@@ -69,13 +69,21 @@ class AskController:
     def ask(self, request, payload: AskIn):
         """
         Updated: hybrid retrieval (pgvector cosine + FTS) then call LLM.
-        AskIn should have: question (str), and optionally tenant_id (str).
+        AskIn should have: messages (List[MessageContent]), and optionally tenant_id (str).
         If tenant_id is not provided, we default to 'public'.
+        Extracts the latest user message from the messages array.
         """
         tenant_id = payload.tenant_id
-        question = payload.question.strip()
+        
+        # Extract the latest user message from the messages array
+        user_messages = [msg for msg in payload.messages if msg.role == "user"]
+        if not user_messages:
+            return AskOut(error="No user message found in the messages array.")
+        
+        question = user_messages[-1].text.strip()  # Get the latest user message
         
         print(f"DEBUG: Ask request - tenant_id: {tenant_id}, question: {question}")
+        print(f"DEBUG: Total messages: {len(payload.messages)}, user messages: {len(user_messages)}")
 
         # Embed question once
         qvec = embed_texts([question])[0]
@@ -113,15 +121,18 @@ If you use the context, cite sources by number like [1], [2] when helpful.
 If the context is insufficient, say so briefly and answer to the best of your ability.
 """
 
-        resp = _llm.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
-        answer = resp.choices[0].message.content
+        try:
+            resp = _llm.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            answer = resp.choices[0].message.content
 
-        # Preserve your AskOut(answer=...)
-        return AskOut(answer=answer)
+            # Return in the new format
+            return AskOut(text=answer, role="assistant")
+        except Exception as e:
+            return AskOut(error=f"Error generating response: {str(e)}")
 
 @api_controller("v1", tags=["crawl"])
 class CrawlController:

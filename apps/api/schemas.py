@@ -1,12 +1,21 @@
 from pydantic import BaseModel, HttpUrl, Field
-from typing import Optional
+from typing import Optional, List, Union
+
+class MessageContent(BaseModel):
+    """Message content for chat-based requests"""
+    role: str  # "user", "assistant", "system"
+    text: str
 
 class AskIn(BaseModel):
-    question: str
+    messages: List[MessageContent]
     tenant_id: Optional[str] = "public"
 
 class AskOut(BaseModel):
-    answer: str
+    """Response format matching UI component expectations"""
+    text: Optional[str] = None
+    role: Optional[str] = "assistant"
+    error: Optional[str] = None
+    overwrite: Optional[bool] = None
 
 class CrawlIn(BaseModel):
     url: HttpUrl
