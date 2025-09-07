@@ -1,9 +1,11 @@
 import os
 from typing import List
 from openai import OpenAI
+from django.conf import settings
 
-_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+
+_client = OpenAI(api_key=settings.OPENAI_API_KEY)
+_MODEL = settings.EMBEDDING_MODEL
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     if not texts: return []
