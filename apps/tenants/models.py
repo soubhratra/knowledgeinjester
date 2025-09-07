@@ -7,9 +7,10 @@ from django.contrib.auth.models import User
 
 class Organization(models.Model):
     """Organization/tenant model."""
-    
+    id = models.BigAutoField(primary_key=True)
     name = models.CharField(max_length=255)
     slug = models.SlugField(unique=True)
+    tenant_id = models.CharField(max_length=64, unique=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -27,8 +28,8 @@ class Organization(models.Model):
 
 class DataSource(models.Model):
     """Data source configuration per organization."""
-    
-    organization = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name='data_sources')
+    id = models.BigAutoField(primary_key=True)
+    tenant = models.ForeignKey(Organization, on_delete=models.CASCADE, related_name="sources")
     name = models.CharField(max_length=255)
     source_type = models.CharField(max_length=50, choices=[
         ('website', 'Website'),
@@ -36,16 +37,16 @@ class DataSource(models.Model):
         ('api', 'API'),
     ])
     config = models.JSONField(default=dict)
-    is_active = models.BooleanField(default=True)
+    active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
     class Meta:
         db_table = 'data_sources'
-        unique_together = ['organization', 'name']
+        unique_together = ['tenant', 'name']
     
     def __str__(self):
-        return f"{self.organization.name} - {self.name}"
+        return f"{self.tenant.name} - {self.name}"
 
 
 class CrawlJob(models.Model):

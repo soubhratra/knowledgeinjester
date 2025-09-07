@@ -1,40 +1,43 @@
-"""
-Vectorization services for document processing.
-"""
-from typing import List
-from apps.core.types import Doc, UpsertSummary
-from apps.core.logging import get_logger
+from typing import List, Tuple
+from apps.core.hashing import sha256_str
+from apps.core.types import Doc
+from .chunker import chunk_docs
+from .embedder import embed_texts
+from .supabase_store import upsert_chunks, write_embeddings
 
-logger = get_logger(__name__)
+def vectorize_docs(tenant_id: str, docs: List[Doc]) -> Tuple[int,int]:
+    # chunk
+    chunks = []
+    # group docs by URL to create a stable doc hash per doc
+    for d in docs:
+        chs = chunk_docs([d])
+        full_str = (d.title or "") + "\n".join([c["text"] for c in chs])
+        dhash = sha256_str(full_str)
+        for c in chs:
+            c["doc_hash"] = dhash
+        chunks.extend(chs)
 
+    docs_count, chunks_count = upsert_chunks(tenant_id, chunks)
 
-def vectorize_docs(docs: List[Doc]) -> UpsertSummary:
-    """
-    Vectorize documents and upsert to vector store.
-    
-    Args:
-        docs: List of documents to vectorize
-        
-    Returns:
-        Summary of vectorization operation
-    """
-    logger.info(f"Vectorizing {len(docs)} documents")
-    
-    # Placeholder implementation
-    # In a real implementation, you'd:
-    # 1. Chunk the documents
-    # 2. Generate embeddings
-    # 3. Upsert to Supabase vector store
-    
-    summary = UpsertSummary(
-        total_chunks=0,
-        successful_upserts=0,
-        failed_upserts=0,
-        skipped_duplicates=0,
-        processing_time_seconds=0.0
-    )
-    
-    logger.info(f"Completed vectorization: {summary}")
-    return summary
+    # fetch inserted chunk ids for embeddings
+    # simplest approach: re-select by (tenant_id, doc_hash)
+    from django.db import connection
+    chunk_texts = []
+    chunk_ids = []
+    with connection.cursor() as cur:
+        doc_hashes = tuple({c["doc_hash"] for c in chunks})
+        if doc_hashes:
+            placeholders = ','.join(['%s'] * len(doc_hashes))
+            cur.execute(f"""
+              SELECT c.id, c.text FROM vectorizer_chunk c
+              JOIN vectorizer_document d ON d.id = c.document_id
+              WHERE c.tenant_id=%s AND d.doc_hash IN ({placeholders})
+              ORDER BY c.id ASC
+            """, [tenant_id] + list(doc_hashes))
+            for row in cur.fetchall():
+                chunk_ids.append(row[0]); chunk_texts.append(row[1])
+        # If no chunks, chunk_ids and chunk_texts remain empty lists
 
-
+    vectors = embed_texts(chunk_texts)
+    write_embeddings(tenant_id, chunk_ids, vectors)
+    return docs_count, len(chunk_ids)

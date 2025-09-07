@@ -45,6 +45,7 @@ def test_organization() -> Organization:
     return Organization.objects.create(
         name="Test Organization",
         slug="test-org",
+        tenant_id="test-tenant-123",
         supabase_url="https://test.supabase.co",
         supabase_anon_key="test-anon-key",
         supabase_service_key="test-service-key"
@@ -55,7 +56,7 @@ def test_organization() -> Organization:
 def test_data_source(test_organization: Organization) -> DataSource:
     """Create a test data source."""
     return DataSource.objects.create(
-        organization=test_organization,
+        tenant=test_organization,
         name="Test Website",
         source_type="website",
         config={"url": "https://example.com"}
@@ -146,10 +147,11 @@ class BaseTestCase(TestCase):
         """Set up test data."""
         self.organization = Organization.objects.create(
             name="Test Organization",
-            slug="test-org"
+            slug="test-org",
+            tenant_id="test-tenant-123"
         )
         self.data_source = DataSource.objects.create(
-            organization=self.organization,
+            tenant=self.organization,
             name="Test Website",
             source_type="website",
             config={"url": "https://example.com"}

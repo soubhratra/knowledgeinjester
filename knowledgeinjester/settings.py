@@ -1,6 +1,8 @@
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+from django.urls import reverse_lazy
+from django.templatetags.static import static
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -11,9 +13,10 @@ load_dotenv(os.path.join(BASE_DIR, '.env'))
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-not-for-prod")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
-ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
+ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",")
 
 INSTALLED_APPS = [
+    "unfold",  # Must be before django.contrib.admin
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -45,24 +48,44 @@ WSGI_APPLICATION = "knowledgeinjester.wsgi.application"
 ASGI_APPLICATION = "knowledgeinjester.asgi.application"
 
 DATABASES = {
+    # "default": {
+    #     "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.sqlite3"),
+    #     "NAME": os.getenv("DB_NAME", BASE_DIR / "db.sqlite3"),
+    #     "USER": os.getenv("DB_USER", ""),
+    #     "PASSWORD": os.getenv("DB_PASSWORD", ""),
+    #     "HOST": os.getenv("DB_HOST", ""),
+    #     "PORT": os.getenv("DB_PORT", ""),
+    # }
     "default": {
-        "ENGINE": os.getenv("DB_ENGINE", "django.db.backends.sqlite3"),
-        "NAME": os.getenv("DB_NAME", BASE_DIR / "db.sqlite3"),
-        "USER": os.getenv("DB_USER", ""),
-        "PASSWORD": os.getenv("DB_PASSWORD", ""),
-        "HOST": os.getenv("DB_HOST", ""),
-        "PORT": os.getenv("DB_PORT", ""),
+        "ENGINE": "django.db.backends.postgresql",
+        "NAME": os.getenv("DB_NAME"),
+        "USER": os.getenv("DB_USER"),
+        "PASSWORD": os.getenv("DB_PASSWORD"),
+        "HOST": os.getenv("DB_HOST"),
+        "PORT": os.getenv("DB_PORT", "5432"),
+        "OPTIONS": {"sslmode": "require"},
     }
 }
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "static"
+ROOT_URLCONF = "knowledgeinjester.urls"
+WSGI_APPLICATION = "knowledgeinjester.wsgi.application"
+ASGI_APPLICATION = "knowledgeinjester.asgi.application"
 
 ENV = os.getenv("ENV", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
+# Celery (optional)
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "1536"))
+RETRIEVAL_TOP_K = int(os.getenv("RETRIEVAL_TOP_K", "6"))
+MIN_SIM_SCORE = float(os.getenv("MIN_SIM_SCORE", "0.35"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
@@ -83,3 +106,18 @@ TEMPLATES = [
         },
     },
 ]
+
+# Django Unfold Configuration
+UNFOLD = {
+    "SITE_TITLE": "Knowledge Injester Admin",
+    "SITE_HEADER": "Knowledge Injester",
+    "SITE_URL": "/",
+    "SITE_SYMBOL": "speed",
+    "SHOW_HISTORY": True,
+    "SHOW_VIEW_ON_SITE": True,
+    "ENVIRONMENT": "Knowledge Injester",
+    "SIDEBAR": {
+        "show_search": True,
+        "show_all_applications": True,
+    },
+}

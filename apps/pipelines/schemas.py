@@ -20,10 +20,11 @@ class PipelineState(BaseModel):
     processed_docs: List[Doc] = Field(default_factory=list)
     
     # Final results
-    vectorization_summary: Optional[UpsertSummary] = None
+    vectorization_summary: Optional[Dict[str, Any]] = None
+    result: Optional[Dict[str, Any]] = None
     
     # Metadata
-    job_id: str
+    job_id: str = Field(default_factory=lambda: "default")
     status: str = "pending"  # pending, crawling, extracting, vectorizing, completed, failed
     error_message: Optional[str] = None
     

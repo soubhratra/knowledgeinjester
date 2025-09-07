@@ -16,6 +16,7 @@ class TestDatabaseModels:
         org = Organization.objects.create(
             name="Test Organization",
             slug="test-org",
+            tenant_id="test-tenant-123",
             supabase_url="https://test.supabase.co",
             supabase_anon_key="test-anon-key",
             supabase_service_key="test-service-key"
@@ -23,6 +24,7 @@ class TestDatabaseModels:
         
         assert org.name == "Test Organization"
         assert org.slug == "test-org"
+        assert org.tenant_id == "test-tenant-123"
         assert org.supabase_url == "https://test.supabase.co"
         assert str(org) == "Test Organization"
     
@@ -30,42 +32,44 @@ class TestDatabaseModels:
         """Test organization slug uniqueness."""
         Organization.objects.create(
             name="First Org",
-            slug="test-org"
+            slug="test-org",
+            tenant_id="tenant-1"
         )
         
         with pytest.raises(Exception):  # Should raise IntegrityError
             Organization.objects.create(
                 name="Second Org",
-                slug="test-org"  # Duplicate slug
+                slug="test-org",  # Duplicate slug
+                tenant_id="tenant-2"
             )
     
     def test_data_source_creation(self, test_organization):
         """Test creating a data source."""
         source = DataSource.objects.create(
-            organization=test_organization,
+            tenant=test_organization,
             name="Test Website",
             source_type="website",
             config={"url": "https://example.com", "max_pages": 100}
         )
         
-        assert source.organization == test_organization
+        assert source.tenant == test_organization
         assert source.name == "Test Website"
         assert source.source_type == "website"
         assert source.config == {"url": "https://example.com", "max_pages": 100}
-        assert source.is_active is True
+        assert source.active is True
         assert str(source) == "Test Organization - Test Website"
     
     def test_data_source_unique_name_per_organization(self, test_organization):
         """Test data source name uniqueness per organization."""
         DataSource.objects.create(
-            organization=test_organization,
+            tenant=test_organization,
             name="Test Source",
             source_type="website"
         )
         
         with pytest.raises(Exception):  # Should raise IntegrityError
             DataSource.objects.create(
-                organization=test_organization,
+                tenant=test_organization,
                 name="Test Source",  # Duplicate name
                 source_type="api"
             )
@@ -148,7 +152,7 @@ class TestDatabaseModels:
         """Test model relationships."""
         # Create data source
         source = DataSource.objects.create(
-            organization=test_organization,
+            tenant=test_organization,
             name="Test Source",
             source_type="website"
         )
@@ -171,13 +175,13 @@ class TestDatabaseModels:
         # Test relationships
         assert crawl_job.organization == test_organization
         assert crawl_job.data_source == source
-        assert source.organization == test_organization
+        assert source.tenant == test_organization
         assert ingest_job.organization == test_organization
         
         # Test reverse relationships
         assert crawl_job in test_organization.crawl_jobs.all()
         assert crawl_job in source.crawl_jobs.all()
         assert ingest_job in test_organization.ingest_jobs.all()
-        assert source in test_organization.data_sources.all()
+        assert source in test_organization.sources.all()
 
 

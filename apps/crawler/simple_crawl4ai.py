@@ -217,6 +217,59 @@ async def crawl_site(root_url: str, max_pages: int = 100) -> None:
 
     print(f"\nCrawled {len(titles)} page(s).")
 
+async def crawl_site_with_data(root_url: str, max_pages: int = 100) -> List[PageRaw]:
+    """
+    Crawl a site and return PageRaw objects instead of just saving to disk.
+    """
+    from apps.core.types import PageRaw
+    
+    # 1) Discover URLs
+    urls = await _discover_from_sitemap(root_url, max_urls=max_pages)
+    if not urls:
+        urls = await _bfs_internal_links(root_url, max_pages=max_pages)
+
+    print(f"Discovered {len(urls)} URL(s) to crawl")
+
+    # 2) Crawl and collect data
+    md_gen = DefaultMarkdownGenerator(
+        content_filter=PruningContentFilter(threshold=0.4, threshold_type="fixed")
+    )
+    run_conf = CrawlerRunConfig(
+        cache_mode=CacheMode.BYPASS,
+        markdown_generator=md_gen,
+        only_text=True,
+        exclude_all_images=True,
+        word_count_threshold=50,
+        stream=True,
+    )
+
+    pages = []
+    async with AsyncWebCrawler() as crawler:
+        async for res in await crawler.arun_many(urls, config=run_conf):
+            if res.success:
+                title = (res.metadata or {}).get("title") if isinstance(res.metadata, dict) else None
+                content = getattr(res, "markdown", "") or ""
+                
+                # Create PageRaw object
+                page = PageRaw(
+                    content_id=f"crawl_{hashlib.md5(res.url.encode()).hexdigest()[:8]}",
+                    url=res.url,
+                    title=title or urlparse(res.url).path or res.url,
+                    content=content,
+                    metadata={
+                        "crawled_at": datetime.now().isoformat(),
+                        "word_count": len(content.split()) if content else 0,
+                        "source": "crawl4ai"
+                    }
+                )
+                pages.append(page)
+                print(f"✓ {page.title}")
+            else:
+                print(f"✗ {res.url} -> {res.error_message}")
+
+    print(f"\nCrawled {len(pages)} page(s).")
+    return pages
+
 if __name__ == "__main__":
     # CLI usage:
     #   python -m knowledgeinjester.crawler.simple_crawl4ai https://example.com 100

@@ -15,7 +15,7 @@ class TestAPIEndpoints:
     
     def test_health_endpoint(self, api_client):
         """Test health check endpoint."""
-        response = api_client.get('/api/healthz')
+        response = api_client.get('/healthz')
         
         assert response.status_code == 200
         data = response.json()
@@ -30,7 +30,7 @@ class TestAPIEndpoints:
         }
         
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json'
         )
@@ -40,7 +40,7 @@ class TestAPIEndpoints:
         assert 'message' in data
         assert 'urls_discovered' in data
         assert 'pages_crawled' in data
-        assert 'Successfully crawled' in data['message']
+        assert 'Vectorized crawl completed' in data['message']
     
     def test_crawl_endpoint_invalid_url(self, api_client):
         """Test crawl endpoint with invalid URL."""
@@ -50,7 +50,7 @@ class TestAPIEndpoints:
         }
         
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json'
         )
@@ -65,7 +65,7 @@ class TestAPIEndpoints:
         }
         
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json'
         )
@@ -80,7 +80,7 @@ class TestAPIEndpoints:
         }
         
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json'
         )
@@ -95,7 +95,7 @@ class TestAPIEndpoints:
         }
         
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json'
         )
@@ -109,14 +109,14 @@ class TestAPIEndpoints:
         }
         
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json'
         )
         
         assert response.status_code == 200
         data = response.json()
-        assert 'Successfully crawled' in data['message']
+        assert 'Vectorized crawl completed' in data['message']
     
     def test_crawl_endpoint_with_tenant(self, api_client, test_organization):
         """Test crawl endpoint with tenant context."""
@@ -127,7 +127,7 @@ class TestAPIEndpoints:
         
         # Add tenant header (if implemented)
         response = api_client.post(
-            '/api/v1/crawl',
+            '/v1/crawl',
             data=json.dumps(payload),
             content_type='application/json',
             HTTP_X_TENANT_ID=test_organization.slug

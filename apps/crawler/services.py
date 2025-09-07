@@ -30,14 +30,12 @@ async def crawl_website(
     logger.info(f"Starting crawl of {root_url} (max_pages={max_pages})")
     
     try:
-        # This is a simplified version - in practice you'd want to modify
-        # the crawl_site function to return PageRaw objects instead of just saving files
-        await crawl_site(root_url, max_pages)
+        # Import the crawl_site function and modify it to return data
+        from .simple_crawl4ai import crawl_site_with_data
+        pages = await crawl_site_with_data(root_url, max_pages)
         
-        # For now, return empty list - in a real implementation you'd parse
-        # the saved markdown files and return PageRaw objects
-        logger.info(f"Completed crawl of {root_url}")
-        return []
+        logger.info(f"Completed crawl of {root_url}, found {len(pages)} pages")
+        return pages
         
     except Exception as e:
         logger.error(f"Failed to crawl {root_url}: {e}")

@@ -111,4 +111,7 @@ def cleanup_old_files(days: int = 30) -> int:
     
     return deleted_count
 
-
+def domain_dir(root: Path, domain: str) -> Path:
+    p = root / "crawler" / "markdown" / domain
+    p.mkdir(parents=True, exist_ok=True)
+    return p

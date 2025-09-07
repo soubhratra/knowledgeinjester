@@ -80,4 +80,7 @@ def get_supabase_config() -> dict[str, Any]:
         'service_role_key': get_env_var('SUPABASE_SERVICE_ROLE_KEY', required=True),
     }
 
-
+def env_str(key, default=None): return os.getenv(key, default)
+def env_int(key, default=0): return int(os.getenv(key, default))
+def env_float(key, default=0.0): return float(os.getenv(key, default))
+def env_bool(key, default=False): return os.getenv(key, str(default)).lower() in ("1","true","yes","y")
