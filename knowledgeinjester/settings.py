@@ -125,17 +125,12 @@ UNFOLD = {
 }
 
 # CORS Configuration
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",  # React development server
-    "http://127.0.0.1:3000",  # Alternative localhost
-]
+# Allow all origins for testing and initial deployment
+CORS_ALLOW_ALL_ORIGINS = True
 
-# Allow all origins in development (be more restrictive in production)
-if DEBUG:
-    CORS_ALLOW_ALL_ORIGINS = True
-
-# Allow credentials to be included in CORS requests
-CORS_ALLOW_CREDENTIALS = True
+# IMPORTANT: When CORS_ALLOW_ALL_ORIGINS = True, CORS_ALLOW_CREDENTIALS must be False
+# for security reasons. If you need credentials, specify exact origins instead.
+CORS_ALLOW_CREDENTIALS = False
 
 # Allow common headers
 CORS_ALLOW_HEADERS = [
