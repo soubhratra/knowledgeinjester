@@ -7,7 +7,7 @@ from . import admin as project_admin  # Import our admin configuration
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path("", api.urls),
+    path("api/", api.urls),
 ]
 
 # Serve static files in development
