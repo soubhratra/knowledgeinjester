@@ -45,6 +45,23 @@ class MetaController:
     def healthz(self):
         # keep your ENV passthrough
         return {"status": "ok", "env": getattr(settings, "ENV", "dev")}
+    
+    @http_get("/debug/urls")
+    def debug_urls(self):
+        """Debug endpoint to check configured URL patterns"""
+        from django.urls import get_resolver
+        resolver = get_resolver()
+        url_patterns = []
+        
+        def extract_patterns(patterns, prefix=""):
+            for pattern in patterns:
+                if hasattr(pattern, 'pattern'):
+                    url_patterns.append(f"{prefix}{pattern.pattern}")
+                if hasattr(pattern, 'url_patterns'):
+                    extract_patterns(pattern.url_patterns, f"{prefix}{pattern.pattern}")
+        
+        extract_patterns(resolver.url_patterns)
+        return {"url_patterns": url_patterns}
 
 @api_controller("v1", tags=["ask"])
 class AskController:
