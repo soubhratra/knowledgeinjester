@@ -9,6 +9,13 @@ class MessageContent(BaseModel):
 class AskIn(BaseModel):
     messages: List[MessageContent]
     tenant_id: Optional[str] = "public"
+    citations: Optional[bool] = True
+
+class Source(BaseModel):
+    """Source reference with clickable link"""
+    index: int
+    title: str
+    url: str
 
 class AskOut(BaseModel):
     """Response format matching UI component expectations"""
@@ -16,6 +23,7 @@ class AskOut(BaseModel):
     role: Optional[str] = "assistant"
     error: Optional[str] = None
     overwrite: Optional[bool] = None
+    sources: Optional[List[Source]] = None
 
 class CrawlIn(BaseModel):
     url: HttpUrl

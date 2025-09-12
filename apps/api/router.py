@@ -4,7 +4,7 @@ from pydantic import BaseModel, HttpUrl
 from typing import Dict, Any
 
 # keep your existing schemas for ask/crawl
-from .schemas import AskIn, AskOut, CrawlIn, CrawlOut
+from .schemas import AskIn, AskOut, CrawlIn, CrawlOut, Source
 
 # NEW: minimal ingest DTOs local to this router to avoid breaking your existing schemas
 class IngestIn(BaseModel):
@@ -63,18 +63,97 @@ class MetaController:
         extract_patterns(resolver.url_patterns)
         return {"url_patterns": url_patterns}
 
+def process_citations(hits, answer, enable_citations=True):
+    """
+    Process citations and return filtered sources with continuous numbering.
+    If enable_citations is False, return None for sources.
+    """
+    if not enable_citations:
+        return None
+    
+    # Deduplicate by document (source_url) and create stable source enumeration
+    unique_docs = {}
+    for hit in hits:
+        source_url = hit.get('source_url', '')
+        if source_url not in unique_docs:
+            unique_docs[source_url] = {
+                'title': hit.get('title', ''),
+                'url': source_url,
+                'chunks': []
+            }
+        unique_docs[source_url]['chunks'].append(hit.get('text', ''))
+    
+    # Create stable source list (limit to 3-5 most relevant sources)
+    sources = []
+    source_index = 1
+    for source_url, doc_info in list(unique_docs.items())[:5]:
+        sources.append({
+            'index': source_index,
+            'title': doc_info['title'] or source_url,
+            'url': source_url
+        })
+        source_index += 1
+
+    # Check if the response contains any citation numbers like [1], [2], etc.
+    import re
+    citation_pattern = r'\[\d+\]'
+    has_citations = bool(re.search(citation_pattern, answer))
+    
+    # Only include sources if the response actually contains citations
+    source_objects = None
+    if has_citations and sources:
+        # Extract all citation numbers from the response
+        citation_matches = re.findall(r'\[(\d+)\]', answer)
+        referenced_indices = set(int(match) for match in citation_matches)
+        
+        # Filter sources that are actually referenced
+        referenced_sources = []
+        for source in sources:
+            if source['index'] in referenced_indices:
+                referenced_sources.append(source)
+        
+        # Sort by original index to maintain order
+        referenced_sources.sort(key=lambda x: x['index'])
+        
+        # Create continuous numbering mapping
+        index_mapping = {}
+        source_objects = []
+        for i, source in enumerate(referenced_sources, 1):
+            old_index = source['index']
+            new_index = i
+            index_mapping[old_index] = new_index
+            
+            source_objects.append(Source(
+                index=new_index,
+                title=source['title'],
+                url=source['url']
+            ))
+        
+        # Remap citation numbers in the response text to continuous sequence
+        def replace_citation(match):
+            old_num = int(match.group(1))
+            if old_num in index_mapping:
+                return f"[{index_mapping[old_num]}]"
+            return match.group(0)  # Keep original if not found
+        
+        answer = re.sub(r'\[(\d+)\]', replace_citation, answer)
+    
+    return source_objects, answer
+
 @api_controller("v1", tags=["ask"])
 class AskController:
     @http_post("/ask", response=AskOut)
     def ask(self, request, payload: AskIn):
         """
         Updated: hybrid retrieval (pgvector cosine + FTS) then call LLM.
-        AskIn should have: messages (List[MessageContent]), and optionally tenant_id (str).
+        AskIn should have: messages (List[MessageContent]), and optionally tenant_id (str) and citations (bool).
         If tenant_id is not provided, we default to 'public'.
+        If citations is not provided, we default to True.
         Extracts the latest user message from the messages array.
         """
         tenant_id = payload.tenant_id
-        
+        enable_citations = payload.citations
+        print(f"DEBUG: Ask request - tenant_id: {tenant_id}, enable_citations: {enable_citations}")
         # Extract the latest user message from the messages array
         user_messages = [msg for msg in payload.messages if msg.role == "user"]
         if not user_messages:
@@ -102,24 +181,87 @@ class AskController:
             print(f"DEBUG: Hit {i+1}: text preview='{hit.get('text', '')[:100]}...'")
             print("---")
 
-        # Build short, source-cited context
-        context = "\n\n".join(
-            f"[{i+1}] {h.get('title') or h.get('source_url')}\n{h.get('text','')}"
-            for i, h in enumerate(hits)
-        )
-        print(f"DEBUG: Built context length: {len(context)} characters")
-        print(f"DEBUG: Context preview: {context[:200]}...")
+        # Build context based on citations flag
+        if enable_citations:
+            # Deduplicate by document (source_url) and create stable source enumeration
+            unique_docs = {}
+            for hit in hits:
+                source_url = hit.get('source_url', '')
+                if source_url not in unique_docs:
+                    unique_docs[source_url] = {
+                        'title': hit.get('title', ''),
+                        'url': source_url,
+                        'chunks': []
+                    }
+                unique_docs[source_url]['chunks'].append(hit.get('text', ''))
+            
+            # Create stable source list (limit to 3-5 most relevant sources)
+            sources = []
+            source_index = 1
+            for source_url, doc_info in list(unique_docs.items())[:5]:
+                sources.append({
+                    'index': source_index,
+                    'title': doc_info['title'] or source_url,
+                    'url': source_url
+                })
+                source_index += 1
 
-        prompt = f"""You are a helpful assistant. Use the context to answer accurately.
+            # Build context with stable source numbering
+            context_parts = []
+            for source_url, doc_info in list(unique_docs.items())[:5]:
+                source_num = next(s['index'] for s in sources if s['url'] == source_url)
+                # Combine all chunks from the same document
+                combined_text = '\n\n'.join(doc_info['chunks'])
+                context_parts.append(f"[{source_num}] {doc_info['title'] or source_url}\n{combined_text}")
+            
+            context = "\n\n".join(context_parts)
+            
+            # Build source list for the prompt
+            source_list = "\n".join([f"[{s['index']}] {s['title']} - {s['url']}" for s in sources])
+
+            prompt = f"""You are a helpful assistant. Use the context to answer accurately.
 
 Context:
 {context}
 
 Question: {question}
 
-If you use the context, cite sources by number like [1], [2] when helpful.
+Instructions:
+- Cite sources by number like [1], [2] when helpful
+- Use citation numbers in chronological order - [1] should come before [2], [2] before [3], etc.
+- Keep citations relevant and concise (3-5 sources max)
+- Do not fabricate sources - only cite from the provided context
+- If unsure about a citation, omit it rather than guessing
+- For follow-up questions, reuse the same numbering if you reference the same sources
+
+Sources:
+{source_list}
+
 If the context is insufficient, say so briefly and answer to the best of your ability.
 """
+        else:
+            # Simple context without citations
+            context_parts = []
+            for i, hit in enumerate(hits):
+                context_parts.append(f"{hit.get('title', '') or hit.get('source_url', '')}\n{hit.get('text', '')}")
+            
+            context = "\n\n".join(context_parts)
+
+            prompt = f"""You are a helpful assistant. Use the context to answer accurately.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer the question based on the provided context. Do not include any citations or source references in your response.
+
+If the context is insufficient, say so briefly and answer to the best of your ability.
+"""
+        
+        print(f"DEBUG: Built context length: {len(context)} characters")
+        print(f"DEBUG: Context preview: {context[:200]}...")
+        print(f"DEBUG: Citations enabled: {enable_citations}")
 
         try:
             resp = _llm.chat.completions.create(
@@ -129,8 +271,14 @@ If the context is insufficient, say so briefly and answer to the best of your ab
             )
             answer = resp.choices[0].message.content
 
-            # Return in the new format
-            return AskOut(text=answer, role="assistant")
+            # Process citations based on the flag
+            if enable_citations:
+                source_objects, answer = process_citations(hits, answer, enable_citations=True)
+            else:
+                source_objects = None
+
+            # Return in the new format with sources only if citations are enabled and present
+            return AskOut(text=answer, role="assistant", sources=source_objects)
         except Exception as e:
             return AskOut(error=f"Error generating response: {str(e)}")
 
