@@ -19,6 +19,12 @@ class Organization(models.Model):
     supabase_anon_key = models.CharField(max_length=500, blank=True)
     supabase_service_key = models.CharField(max_length=500, blank=True)
     
+    # Custom prompt configuration per tenant
+    custom_prompt = models.TextField(
+        blank=True,
+        help_text="Custom prompt template for this organization. Use {context}, {question}, and {sources} as placeholders. If empty, default prompt will be used."
+    )
+    
     class Meta:
         db_table = 'organizations'
     

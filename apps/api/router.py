@@ -30,6 +30,11 @@ from apps.vectorizer.embedder import embed_texts
 from apps.vectorizer.supabase_store import hybrid_search
 from openai import OpenAI
 
+# Prompt service for organization-specific prompts
+from .services.prompt_service import PromptService
+# Moderation service for content filtering
+from .services.moderation_service import ModerationService
+
 # You previously imported a different graph (for Q/A) here:
 # from .services.langgraph_pipeline import graph
 # We now use build_graph() for ingestion pipeline, and do RAG explicitly for /ask.
@@ -164,6 +169,18 @@ class AskController:
         print(f"DEBUG: Ask request - tenant_id: {tenant_id}, question: {question}")
         print(f"DEBUG: Total messages: {len(payload.messages)}, user messages: {len(user_messages)}")
 
+        # Moderate the question content
+        moderation_service = ModerationService()
+        moderation_result = moderation_service.moderate_question(question)
+        
+        if not moderation_result["is_appropriate"]:
+            print(f"DEBUG: Question flagged by moderation: {moderation_result['reason']}")
+            return AskOut(
+                text=moderation_result["response"],
+                role="assistant",
+                sources=None
+            )
+
         # Embed question once
         qvec = embed_texts([question])[0]
         print(f"DEBUG: Generated embedding vector of length: {len(qvec)}")
@@ -219,26 +236,14 @@ class AskController:
             # Build source list for the prompt
             source_list = "\n".join([f"[{s['index']}] {s['title']} - {s['url']}" for s in sources])
 
-            prompt = f"""You are a helpful assistant. Use the context to answer accurately.
-
-Context:
-{context}
-
-Question: {question}
-
-Instructions:
-- Cite sources by number like [1], [2] when helpful
-- Use citation numbers in chronological order - [1] should come before [2], [2] before [3], etc.
-- Keep citations relevant and concise (3-5 sources max)
-- Do not fabricate sources - only cite from the provided context
-- If unsure about a citation, omit it rather than guessing
-- For follow-up questions, reuse the same numbering if you reference the same sources
-
-Sources:
-{source_list}
-
-If the context is insufficient, say so briefly and answer to the best of your ability.
-"""
+            # Use organization-specific prompt with fallback to default
+            prompt = PromptService.get_prompt_for_organization(
+                tenant_id=tenant_id,
+                enable_citations=False,
+                context=context,
+                question=question,
+                sources=source_list
+            )
         else:
             # Simple context without citations
             context_parts = []
@@ -247,17 +252,14 @@ If the context is insufficient, say so briefly and answer to the best of your ab
             
             context = "\n\n".join(context_parts)
 
-            prompt = f"""You are a helpful assistant. Use the context to answer accurately.
-
-Context:
-{context}
-
-Question: {question}
-
-Answer the question based on the provided context. Do not include any citations or source references in your response.
-
-If the context is insufficient, say so briefly and answer to the best of your ability.
-"""
+            # Use organization-specific prompt with fallback to default
+            prompt = PromptService.get_prompt_for_organization(
+                tenant_id=tenant_id,
+                enable_citations=False,
+                context=context,
+                question=question,
+                sources=""
+            )
         
         print(f"DEBUG: Built context length: {len(context)} characters")
         print(f"DEBUG: Context preview: {context[:200]}...")

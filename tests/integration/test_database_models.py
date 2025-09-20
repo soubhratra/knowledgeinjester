@@ -28,6 +28,57 @@ class TestDatabaseModels:
         assert org.supabase_url == "https://test.supabase.co"
         assert str(org) == "Test Organization"
     
+    def test_organization_custom_prompt(self):
+        """Test organization with custom prompt."""
+        custom_prompt = """You are a specialized assistant for {organization_name}.
+
+Context:
+{context}
+
+Question: {question}
+
+Please provide a detailed answer based on the context.
+
+Sources:
+{sources}"""
+        
+        org = Organization.objects.create(
+            name="Custom Prompt Org",
+            slug="custom-prompt-org",
+            tenant_id="custom-prompt-123",
+            custom_prompt=custom_prompt
+        )
+        
+        assert org.custom_prompt == custom_prompt
+        assert "{organization_name}" in org.custom_prompt
+        assert "{context}" in org.custom_prompt
+        assert "{question}" in org.custom_prompt
+        assert "{sources}" in org.custom_prompt
+    
+    def test_organization_empty_custom_prompt(self):
+        """Test organization with empty custom prompt."""
+        org = Organization.objects.create(
+            name="Empty Prompt Org",
+            slug="empty-prompt-org",
+            tenant_id="empty-prompt-123",
+            custom_prompt=""
+        )
+        
+        assert org.custom_prompt == ""
+        assert not org.custom_prompt.strip()
+    
+    def test_organization_custom_prompt_blank(self):
+        """Test organization with blank custom prompt."""
+        org = Organization.objects.create(
+            name="Blank Prompt Org",
+            slug="blank-prompt-org",
+            tenant_id="blank-prompt-123",
+            custom_prompt="   \n\t   "
+        )
+        
+        assert org.custom_prompt == "   \n\t   "
+        assert not org.custom_prompt.strip()
+    
     def test_organization_unique_slug(self):
         """Test organization slug uniqueness."""
         Organization.objects.create(
