@@ -3,8 +3,8 @@ from django.conf import settings
 from pydantic import BaseModel, HttpUrl
 from typing import Dict, Any
 
-# keep your existing schemas for ask/crawl
-from .schemas import AskIn, AskOut, CrawlIn, CrawlOut, Source
+# keep your existing schemas for ask
+from .schemas import AskIn, AskOut, Source
 
 # NEW: minimal ingest DTOs local to this router to avoid breaking your existing schemas
 class IngestIn(BaseModel):
@@ -284,41 +284,6 @@ class AskController:
         except Exception as e:
             return AskOut(error=f"Error generating response: {str(e)}")
 
-@api_controller("v1", tags=["crawl"])
-class CrawlController:
-    @http_post("/crawl", response=CrawlOut)
-    def crawl(self, request, payload: CrawlIn):
-        """
-        Retrofit: run the full LangGraph pipeline (crawl→extract→vectorize)
-        so that /crawl completes the vectorization step too.
-        CrawlIn should have: url (HttpUrl), max_pages (int, optional), tenant_id (optional).
-        """
-        try:
-            url_str = str(payload.url)
-            max_pages = payload.max_pages or 100
-            tenant_id = payload.tenant_id
-
-            graph = build_graph()
-            state = PipelineState(tenant_id=tenant_id, root_url=url_str, max_pages=max_pages)
-            final_state = graph.invoke(state)
-            # LangGraph returns state as a dictionary, not a PipelineState object
-            if isinstance(final_state, dict):
-                result = final_state.get("result") or final_state.get("vectorization_summary") or {"docs": 0, "chunks": 0}
-            else:
-                result = final_state.result or final_state.vectorization_summary or {"docs": 0, "chunks": 0}
-
-            # Map to your CrawlOut fields; we treat docs as pages discovered for compatibility
-            return CrawlOut(
-                message=f"Vectorized crawl completed for {url_str}",
-                urls_discovered=result.get("docs", 0),
-                pages_crawled=result.get("docs", 0),
-            )
-        except Exception as e:
-            return CrawlOut(
-                message=f"Error crawling {payload.url}: {str(e)}",
-                urls_discovered=0,
-                pages_crawled=0,
-            )
 
 @api_controller("v1", tags=["ingest"])
 class IngestController:
@@ -369,4 +334,4 @@ class IngestController:
             print(f"DEBUG: Traceback: {traceback.format_exc()}")
             return IngestOut(job_id=-1, docs=0, chunks=0, message=f"error: {e}")
 
-api.register_controllers(MetaController, AskController, CrawlController, IngestController)
+api.register_controllers(MetaController, AskController, IngestController)
