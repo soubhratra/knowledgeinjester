@@ -11,9 +11,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # in the current directory or parent directories.
 load_dotenv(os.path.join(BASE_DIR, '.env'))
 
+def _split_env(name, default=""):
+    return [x.strip() for x in os.getenv(name, default).split(",") if x.strip()]
+
+# ---- Static files (important for Unfold styling) ----
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"            # collectstatic output
+STATICFILES_DIRS = [BASE_DIR / "static"]          # your project-level static folder
+
+ENV = os.getenv("ENV", "dev")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-not-for-prod")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
-ALLOWED_HOSTS = os.getenv("DJANGO_ALLOWED_HOSTS", "*").split(",")
+
+ALLOWED_HOSTS = _split_env("DJANGO_ALLOWED_HOSTS", ".spectrumsense.co")
+CSRF_TRUSTED_ORIGINS = _split_env("DJANGO_CSRF_TRUSTED_ORIGINS", "https://*.spectrumsense.co")
+
+# ---- Proxy/HTTPS (recommended behind Northflank) ----
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
 
 INSTALLED_APPS = [
     "unfold",  # Must be before django.contrib.admin
@@ -37,6 +56,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",  # CORS middleware
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -44,6 +64,8 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
 ]
+
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 ROOT_URLCONF = "knowledgeinjester.urls"
 WSGI_APPLICATION = "knowledgeinjester.wsgi.application"
@@ -68,15 +90,6 @@ DATABASES = {
         "OPTIONS": {"sslmode": "require"},
     }
 }
-
-STATIC_URL = "static/"
-STATIC_ROOT = BASE_DIR / "static"
-ROOT_URLCONF = "knowledgeinjester.urls"
-WSGI_APPLICATION = "knowledgeinjester.wsgi.application"
-ASGI_APPLICATION = "knowledgeinjester.asgi.application"
-
-ENV = os.getenv("ENV", "dev")
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
 # Celery (optional)
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
