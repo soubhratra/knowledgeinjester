@@ -120,3 +120,30 @@ class IngestJob(models.Model):
         return f"{self.job_id} - {self.root_url}"
 
 
+class ActivityAudit(models.Model):
+    """Audit trail for tenant activities like ingest and cleanup operations."""
+    
+    ACTIVITY_TYPES = [
+        ('ingest', 'Ingest'),
+        ('cleanup', 'Cleanup'),
+    ]
+    
+    id = models.BigAutoField(primary_key=True)
+    tenant_id = models.CharField(max_length=64, db_index=True)
+    activity_type = models.CharField(max_length=20, choices=ACTIVITY_TYPES)
+    performed_by = models.CharField(max_length=100, default='admin')
+    details = models.JSONField(default=dict, help_text="Additional details about the activity")
+    created_at = models.DateTimeField(auto_now_add=True)
+    
+    class Meta:
+        db_table = 'activity_audit'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['tenant_id', 'created_at']),
+            models.Index(fields=['activity_type', 'created_at']),
+        ]
+    
+    def __str__(self):
+        return f"{self.tenant_id} - {self.activity_type} by {self.performed_by} at {self.created_at}"
+
+

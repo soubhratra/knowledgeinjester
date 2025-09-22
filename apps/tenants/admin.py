@@ -3,7 +3,7 @@ Admin configuration for tenant models.
 """
 from django.contrib import admin
 from unfold.admin import ModelAdmin
-from .models import Organization, DataSource, CrawlJob, IngestJob
+from .models import Organization, DataSource, CrawlJob, IngestJob, ActivityAudit
 
 
 @admin.register(Organization)
@@ -50,3 +50,25 @@ class IngestJobAdmin(ModelAdmin):
     list_filter = ['status', 'created_at']
     search_fields = ['job_id', 'root_url', 'organization__name']
     readonly_fields = ['created_at', 'updated_at', 'completed_at']
+
+
+@admin.register(ActivityAudit)
+class ActivityAuditAdmin(ModelAdmin):
+    list_display = ['tenant_id', 'activity_type', 'performed_by', 'created_at']
+    list_filter = ['activity_type', 'performed_by', 'created_at']
+    search_fields = ['tenant_id', 'performed_by']
+    readonly_fields = ['created_at']
+    ordering = ['-created_at']
+    
+    fieldsets = (
+        ('Activity Information', {
+            'fields': ('tenant_id', 'activity_type', 'performed_by')
+        }),
+        ('Details', {
+            'fields': ('details',),
+            'classes': ('collapse',)
+        }),
+        ('Timestamp', {
+            'fields': ('created_at',)
+        }),
+    )

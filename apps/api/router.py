@@ -36,6 +36,9 @@ from apps.vectorizer.embedder import embed_texts
 from apps.vectorizer.supabase_store import hybrid_search, get_tenant_stats, cleanup_tenant_data
 from openai import OpenAI
 
+# Activity audit
+from apps.tenants.models import ActivityAudit
+
 # Prompt service for organization-specific prompts
 from .services.prompt_service import PromptService
 # Moderation service for content filtering
@@ -90,6 +93,19 @@ class AdminController:
         """Clean up all data for a tenant."""
         try:
             deleted_docs, deleted_chunks = cleanup_tenant_data(tenant_id)
+            
+            # Log the cleanup activity
+            ActivityAudit.objects.create(
+                tenant_id=tenant_id,
+                activity_type='cleanup',
+                performed_by='admin',
+                details={
+                    'deleted_documents': deleted_docs,
+                    'deleted_chunks': deleted_chunks,
+                    'operation': 'tenant_cleanup'
+                }
+            )
+            
             return {
                 "message": f"Cleaned up {deleted_docs} documents and {deleted_chunks} chunks",
                 "deleted_documents": deleted_docs,
@@ -353,9 +369,38 @@ class IngestController:
                     print(f"DEBUG: final_state.vectorization_summary = {getattr(final_state, 'vectorization_summary', 'NOT_FOUND')}")
                     out = final_state.result or final_state.vectorization_summary or {"docs": 0, "chunks": 0}
                 print(f"DEBUG: Final out = {out}")
+                
+                # Log the ingest activity
+                ActivityAudit.objects.create(
+                    tenant_id=payload.tenant_id,
+                    activity_type='ingest',
+                    performed_by='admin',
+                    details={
+                        'url': str(payload.url),
+                        'max_pages': payload.max_pages,
+                        'docs_processed': out.get("docs", 0),
+                        'chunks_created': out.get("chunks", 0),
+                        'operation': 'sync_ingest'
+                    }
+                )
+                
                 return IngestOut(job_id=0, docs=out.get("docs", 0), chunks=out.get("chunks", 0), message="sync")
             else:
                 async_res = ingest_task.delay(payload.tenant_id, url_str, payload.max_pages)
+                
+                # Log the async ingest activity
+                ActivityAudit.objects.create(
+                    tenant_id=payload.tenant_id,
+                    activity_type='ingest',
+                    performed_by='admin',
+                    details={
+                        'url': str(payload.url),
+                        'max_pages': payload.max_pages,
+                        'job_id': async_res.id,
+                        'operation': 'async_ingest'
+                    }
+                )
+                
                 # return Celery task id so the caller can poll if they want
                 return IngestOut(job_id=async_res.id, docs=0, chunks=0, message="enqueued")
         except Exception as e:
