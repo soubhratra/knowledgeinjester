@@ -18,6 +18,12 @@ class IngestOut(BaseModel):
     chunks: int
     message: str | None = None
 
+class TenantStatsOut(BaseModel):
+    documents: int
+    chunks: int
+    total_size: str
+    total_bytes: int
+
 # LangGraph (our crawl→extract→vectorize graph)
 from apps.pipelines.langgraph.graph import build_graph
 from apps.pipelines.schemas import PipelineState
@@ -27,7 +33,7 @@ from apps.vectorizer.tasks import ingest_task
 
 # RAG pieces
 from apps.vectorizer.embedder import embed_texts
-from apps.vectorizer.supabase_store import hybrid_search
+from apps.vectorizer.supabase_store import hybrid_search, get_tenant_stats, cleanup_tenant_data
 from openai import OpenAI
 
 # Prompt service for organization-specific prompts
@@ -67,6 +73,30 @@ class MetaController:
         
         extract_patterns(resolver.url_patterns)
         return {"url_patterns": url_patterns}
+
+@api_controller("v1", tags=["admin"])
+class AdminController:
+    @http_get("/admin/stats/{tenant_id}", response=TenantStatsOut)
+    def get_tenant_stats(self, request, tenant_id: str):
+        """Get statistics for a tenant's data."""
+        try:
+            stats = get_tenant_stats(tenant_id)
+            return TenantStatsOut(**stats)
+        except Exception as e:
+            return {"error": f"Failed to get stats: {str(e)}"}
+    
+    @http_post("/admin/cleanup/{tenant_id}")
+    def cleanup_tenant(self, request, tenant_id: str):
+        """Clean up all data for a tenant."""
+        try:
+            deleted_docs, deleted_chunks = cleanup_tenant_data(tenant_id)
+            return {
+                "message": f"Cleaned up {deleted_docs} documents and {deleted_chunks} chunks",
+                "deleted_documents": deleted_docs,
+                "deleted_chunks": deleted_chunks
+            }
+        except Exception as e:
+            return {"error": f"Failed to cleanup: {str(e)}"}
 
 def process_citations(hits, answer, enable_citations=True):
     """
@@ -334,4 +364,4 @@ class IngestController:
             print(f"DEBUG: Traceback: {traceback.format_exc()}")
             return IngestOut(job_id=-1, docs=0, chunks=0, message=f"error: {e}")
 
-api.register_controllers(MetaController, AskController, IngestController)
+api.register_controllers(MetaController, AskController, IngestController, AdminController)

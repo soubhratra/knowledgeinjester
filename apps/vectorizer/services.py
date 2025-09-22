@@ -6,6 +6,16 @@ from .embedder import embed_texts
 from .supabase_store import upsert_chunks, write_embeddings
 
 def vectorize_docs(tenant_id: str, docs: List[Doc]) -> Tuple[int,int]:
+    """
+    Vectorize documents with replacive ingestion.
+    This will clean up old data for the same URLs before inserting new data.
+    """
+    if not docs:
+        print("DEBUG: No documents to vectorize")
+        return 0, 0
+        
+    print(f"DEBUG: Vectorizing {len(docs)} documents for tenant_id='{tenant_id}'")
+    
     # chunk
     chunks = []
     # group docs by URL to create a stable doc hash per doc
@@ -17,7 +27,11 @@ def vectorize_docs(tenant_id: str, docs: List[Doc]) -> Tuple[int,int]:
             c["doc_hash"] = dhash
         chunks.extend(chs)
 
+    print(f"DEBUG: Generated {len(chunks)} chunks from {len(docs)} documents")
+    
+    # This will now clean up old data and insert new data (replacive ingestion)
     docs_count, chunks_count = upsert_chunks(tenant_id, chunks)
+    print(f"DEBUG: Upserted {docs_count} documents and {chunks_count} chunks")
 
     # fetch inserted chunk ids for embeddings
     # simplest approach: re-select by (tenant_id, doc_hash)
@@ -38,6 +52,13 @@ def vectorize_docs(tenant_id: str, docs: List[Doc]) -> Tuple[int,int]:
                 chunk_ids.append(row[0]); chunk_texts.append(row[1])
         # If no chunks, chunk_ids and chunk_texts remain empty lists
 
-    vectors = embed_texts(chunk_texts)
-    write_embeddings(tenant_id, chunk_ids, vectors)
+    print(f"DEBUG: Found {len(chunk_ids)} chunks to embed")
+    
+    if chunk_texts:
+        vectors = embed_texts(chunk_texts)
+        write_embeddings(tenant_id, chunk_ids, vectors)
+        print(f"DEBUG: Generated and stored embeddings for {len(vectors)} chunks")
+    else:
+        print("DEBUG: No chunks to embed")
+        
     return docs_count, len(chunk_ids)
