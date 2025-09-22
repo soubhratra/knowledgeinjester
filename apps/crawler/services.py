@@ -8,7 +8,7 @@ from enum import Enum
 from apps.core.types import PageRaw
 from apps.core.logging import get_logger
 from .simple_crawl4ai import crawl_site_with_data
-from .llm_crawler import crawl_with_llm_extraction
+from .llm_crawler import crawl_with_llm_deep_crawling
 
 logger = get_logger(__name__)
 
@@ -44,7 +44,7 @@ async def crawl_website(
     try:
         if crawler_type == CrawlerType.LLM:
             # Use LLM-based crawler with deep crawling
-            pages = await crawl_with_llm_extraction(
+            pages = await crawl_with_llm_deep_crawling(
                 root_url, max_pages, max_depth, tenant_id
             )
         else:
