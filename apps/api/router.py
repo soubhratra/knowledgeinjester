@@ -11,6 +11,8 @@ class IngestIn(BaseModel):
     tenant_id: str
     url: HttpUrl
     max_pages: int = 200
+    crawler_type: str = "llm"  # "comprehensive" or "llm"
+    max_depth: int = 5  # Only used with LLM crawler
 
 class IngestOut(BaseModel):
     job_id: str | int
@@ -353,6 +355,8 @@ class IngestController:
                     tenant_id=payload.tenant_id,
                     root_url=url_str,
                     max_pages=payload.max_pages,
+                    crawler_type=payload.crawler_type,
+                    max_depth=payload.max_depth,
                 )
                 print(f"DEBUG: Pipeline state created: {type(state)}")
                 
@@ -386,7 +390,13 @@ class IngestController:
                 
                 return IngestOut(job_id=0, docs=out.get("docs", 0), chunks=out.get("chunks", 0), message="sync")
             else:
-                async_res = ingest_task.delay(payload.tenant_id, url_str, payload.max_pages)
+                async_res = ingest_task.delay(
+                    payload.tenant_id, 
+                    url_str, 
+                    payload.max_pages,
+                    payload.crawler_type,
+                    payload.max_depth
+                )
                 
                 # Log the async ingest activity
                 ActivityAudit.objects.create(

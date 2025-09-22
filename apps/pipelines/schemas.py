@@ -14,6 +14,8 @@ class PipelineState(BaseModel):
     root_url: str
     tenant_id: Optional[str] = None
     max_pages: int = 100
+    crawler_type: str = "llm"  # "comprehensive" or "llm"
+    max_depth: int = 5  # Only used with LLM crawler
     
     # Intermediate results
     raw_pages: List[PageRaw] = Field(default_factory=list)

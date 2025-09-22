@@ -88,10 +88,12 @@ COMPREHENSIVE_EXTRACTION_SCHEMA = {
         {"name": "benefits", "selector": ".benefit, .benefits, [class*='benefit']", "type": "text"},
         {"name": "specifications", "selector": ".spec, .specs, .specification, [class*='spec']", "type": "text"},
         
-        # Pricing and financial (keeping but making optional)
-        {"name": "pricing", "selector": ".price, .cost, .pricing, [class*='price'], [class*='cost']", "type": "text"},
-        {"name": "currency", "selector": "[class*='currency'], [class*='symbol']", "type": "text"},
-        {"name": "financial_info", "selector": "[class*='financial'], [class*='money']", "type": "text"},
+        # Pricing and financial (enhanced selectors)
+        {"name": "pricing", "selector": ".price, .cost, .pricing, [class*='price'], [class*='cost'], [class*='pricing'], .amount, .fee, .rate, .charge, .value, .total, .subtotal, .discount, .sale, .offer, .deal, .promo, .special, .muted, [class*='muted'], .text-muted, .price-text, .cost-text", "type": "text"},
+        {"name": "currency", "selector": "[class*='currency'], [class*='symbol'], .currency, .dollar, .euro, .pound, .yen, .symbol", "type": "text"},
+        {"name": "financial_info", "selector": "[class*='financial'], [class*='money'], .financial, .money, .cost, .budget, .investment, .payment, .billing, .invoice", "type": "text"},
+        {"name": "price_text", "selector": "text", "type": "text"},  # Catch any text containing price patterns
+        {"name": "muted_pricing", "selector": "div.muted, .muted div, [class*='muted']", "type": "text"},  # Specific for muted div pricing
         
         # Dates and time
         {"name": "dates", "selector": ".date, .time, [class*='date'], [class*='time']", "type": "text"},
@@ -363,12 +365,17 @@ async def crawl_site_with_data(root_url: str, max_pages: int = 100) -> List[Page
     )
     
     # Create comprehensive extraction strategy for all types of content
-    comprehensive_extraction = JsonCssExtractionStrategy(COMPREHENSIVE_EXTRACTION_SCHEMA)
+    # Fix the schema format for JsonCssExtractionStrategy
+    fixed_schema = {
+        "baseSelector": "body",
+        "fields": COMPREHENSIVE_EXTRACTION_SCHEMA
+    }
+    comprehensive_extraction = JsonCssExtractionStrategy(fixed_schema)
     
     run_conf = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
         markdown_generator=md_gen,
-        extraction_strategy=comprehensive_extraction,  # Comprehensive structured extraction
+        # extraction_strategy=comprehensive_extraction,  # Temporarily disable extraction strategy
         only_text=False,  # Keep HTML structure for better extraction
         exclude_all_images=False,  # Keep images for alt text extraction
         word_count_threshold=10,  # Very low threshold to capture all content
@@ -400,9 +407,64 @@ async def crawl_site_with_data(root_url: str, max_pages: int = 100) -> List[Page
                 extracted_data = {}
                 if hasattr(res, 'extracted_content') and res.extracted_content:
                     extracted_data = res.extracted_content
+                    
+                    # Debug pricing extraction
+                    pricing_data = {k: v for k, v in extracted_data.items() if 'price' in k.lower() or 'cost' in k.lower() or 'financial' in k.lower()}
+                    if pricing_data:
+                        print(f"🔍 DEBUG: Pricing data extracted for {res.url}: {pricing_data}")
+                    else:
+                        print(f"⚠️ DEBUG: No pricing data found for {res.url}")
                 
+                # Post-process content to extract additional pricing information
+                import re
+                price_patterns = [
+                    r'\$[\d,]+(?:\.\d{2})?',  # $123.45, $1,234.56
+                    r'[\d,]+(?:\.\d{2})?\s*(?:dollars?|USD|usd)',  # 123.45 dollars
+                    r'Price:\s*([^\n]+)',  # Price: $123.45
+                    r'Cost:\s*([^\n]+)',  # Cost: $123.45
+                    r'Fee:\s*([^\n]+)',  # Fee: $123.45
+                    r'Rate:\s*([^\n]+)',  # Rate: $123.45
+                    r'<div[^>]*class="[^"]*muted[^"]*"[^>]*>.*?Price:.*?\$[\d,]+.*?</div>',  # Muted div with pricing
+                ]
+                
+                extracted_prices = []
+                for pattern in price_patterns:
+                    matches = re.findall(pattern, content, re.IGNORECASE | re.DOTALL)
+                    extracted_prices.extend(matches)
+                
+                # Also extract from HTML if available
+                if hasattr(res, 'html') and res.html:
+                    html_price_patterns = [
+                        r'<div[^>]*class="[^"]*muted[^"]*"[^>]*>.*?Price:.*?\$[\d,]+.*?</div>',
+                        r'<div[^>]*class="[^"]*muted[^"]*"[^>]*>.*?\$[\d,]+.*?</div>',
+                    ]
+                    for pattern in html_price_patterns:
+                        matches = re.findall(pattern, res.html, re.IGNORECASE | re.DOTALL)
+                        for match in matches:
+                            # Extract just the text content from the HTML
+                            text_match = re.sub(r'<[^>]+>', '', match).strip()
+                            if text_match and '$' in text_match:
+                                extracted_prices.append(text_match)
+                
+                if extracted_prices:
+                    print(f"💰 DEBUG: Found prices in text: {extracted_prices}")
+                    if 'pricing' not in extracted_data:
+                        extracted_data['pricing'] = []
+                    if isinstance(extracted_data['pricing'], list):
+                        extracted_data['pricing'].extend(extracted_prices)
+                    else:
+                        extracted_data['pricing'] = [extracted_data['pricing']] + extracted_prices
+
                 # Combine markdown content with extracted structured data
                 enhanced_content = content
+                
+                # Add extracted pricing information to the content if found
+                if extracted_prices:
+                    pricing_section = "\n\n## Extracted Pricing Information\n"
+                    for price in extracted_prices:
+                        pricing_section += f"- {price}\n"
+                    enhanced_content += pricing_section
+                
                 if extracted_data:
                     # Add extracted information to content in organized sections
                     info_sections = {}
@@ -474,6 +536,17 @@ async def crawl_site_with_data(root_url: str, max_pages: int = 100) -> List[Page
                 )
                 pages.append(page)
                 
+                # Save markdown file to disk
+                try:
+                    saved_to = _save_markdown(
+                        res.url,
+                        title,
+                        enhanced_content
+                    )
+                    print(f"📁 Saved markdown to: {saved_to}")
+                except Exception as e:
+                    print(f"⚠️ Failed to save markdown for {res.url}: {e}")
+                
                 # Enhanced status display
                 stats = page.metadata['extraction_stats']
                 status_icons = []
@@ -538,6 +611,18 @@ async def crawl_site_with_data(root_url: str, max_pages: int = 100) -> List[Page
                         }
                     )
                     pages.append(page)
+                    
+                    # Save markdown file to disk
+                    try:
+                        saved_to = _save_markdown(
+                            res.url,
+                            title,
+                            content
+                        )
+                        print(f"📁 Saved markdown to: {saved_to}")
+                    except Exception as e:
+                        print(f"⚠️ Failed to save markdown for {res.url}: {e}")
+                    
                     print(f"✓ {page.title} (fallback)")
                 else:
                     print(f"✗ {res.url} -> {res.error_message}")

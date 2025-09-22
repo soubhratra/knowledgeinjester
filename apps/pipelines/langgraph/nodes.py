@@ -1,11 +1,22 @@
-from apps.crawler.services import crawl_website_sync
+from apps.crawler.services import crawl_website_sync, CrawlerType
 from apps.extractor.services import extract_markdown
 from apps.vectorizer.services import vectorize_docs
 from apps.pipelines.schemas import PipelineState
 
 def crawl_node(state: PipelineState) -> PipelineState:
     """Crawl website and extract raw pages."""
-    state.raw_pages = crawl_website_sync(state.root_url, state.max_pages)
+    # Convert string to CrawlerType enum
+    crawler_type = CrawlerType.COMPREHENSIVE
+    if state.crawler_type == "llm":
+        crawler_type = CrawlerType.LLM
+    
+    state.raw_pages = crawl_website_sync(
+        state.root_url, 
+        state.max_pages, 
+        state.tenant_id,
+        crawler_type,
+        state.max_depth
+    )
     state.status = "crawling"
     return state
 

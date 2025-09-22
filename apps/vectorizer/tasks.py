@@ -3,9 +3,15 @@ from apps.pipelines.langgraph.graph import build_graph
 from apps.pipelines.schemas import PipelineState
 
 @shared_task
-def ingest_task(tenant_id: str, root_url: str, max_pages: int = 200):
+def ingest_task(tenant_id: str, root_url: str, max_pages: int = 200, crawler_type: str = "llm", max_depth: int = 5):
     graph = build_graph()
-    state = PipelineState(tenant_id=tenant_id, root_url=root_url, max_pages=max_pages)
+    state = PipelineState(
+        tenant_id=tenant_id, 
+        root_url=root_url, 
+        max_pages=max_pages,
+        crawler_type=crawler_type,
+        max_depth=max_depth
+    )
     final_state = graph.invoke(state)
     # LangGraph returns state as a dictionary, not a PipelineState object
     if isinstance(final_state, dict):
