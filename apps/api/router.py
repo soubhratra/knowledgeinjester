@@ -287,7 +287,7 @@ class AskController:
             # Use organization-specific prompt with fallback to default
             prompt = PromptService.get_prompt_for_organization(
                 tenant_id=tenant_id,
-                enable_citations=False,
+                enable_citations=enable_citations,
                 context=context,
                 question=question,
                 sources=source_list
@@ -303,7 +303,7 @@ class AskController:
             # Use organization-specific prompt with fallback to default
             prompt = PromptService.get_prompt_for_organization(
                 tenant_id=tenant_id,
-                enable_citations=False,
+                enable_citations=enable_citations,
                 context=context,
                 question=question,
                 sources=""
