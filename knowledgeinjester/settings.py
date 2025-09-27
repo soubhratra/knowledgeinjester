@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from django.urls import reverse_lazy
 from django.templatetags.static import static
+from decouple import config
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -94,6 +95,11 @@ DATABASES = {
 # Celery (optional)
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
+
+LANGCHAIN_TRACING_V2 = True
+LANGCHAIN_ENDPOINT = "https://api.smith.langchain.com"
+LANGSMITH_API_KEY = os.getenv('LANGCHAIN_API_KEY')
+LANGCHAIN_PROJECT = "spectrum-chat"
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")

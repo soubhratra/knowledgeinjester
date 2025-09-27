@@ -38,6 +38,15 @@ from apps.vectorizer.embedder import embed_texts
 from apps.vectorizer.supabase_store import hybrid_search, get_tenant_stats, cleanup_tenant_data
 from openai import OpenAI
 
+# LangSmith tracing
+try:
+    from langsmith import traceable
+    LANGSMITH_AVAILABLE = True
+except ImportError:
+    LANGSMITH_AVAILABLE = False
+    def traceable(func):
+        return func
+
 # Activity audit
 from apps.tenants.models import ActivityAudit
 
@@ -196,6 +205,7 @@ def process_citations(hits, answer, enable_citations=True):
 @api_controller("v1", tags=["ask"])
 class AskController:
     @http_post("/ask", response=AskOut)
+    @traceable(name="ask_endpoint")
     def ask(self, request, payload: AskIn):
         """
         Updated: hybrid retrieval (pgvector cosine + FTS) then call LLM.
@@ -314,11 +324,25 @@ class AskController:
         print(f"DEBUG: Citations enabled: {enable_citations}")
 
         try:
-            resp = _llm.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-            )
+            # Create a traced LLM call
+            if LANGSMITH_AVAILABLE:
+                from langsmith import traceable
+                
+                @traceable(name="llm_chat_completion")
+                def call_llm(prompt_text):
+                    return _llm.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role": "user", "content": prompt_text}],
+                        temperature=0.2,
+                    )
+                
+                resp = call_llm(prompt)
+            else:
+                resp = _llm.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2,
+                )
             answer = resp.choices[0].message.content
 
             # Process citations based on the flag
