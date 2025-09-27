@@ -38,23 +38,11 @@ def create_superuser():
         print(f"❌ Superuser creation failed: {e}")
         print("   You may need to create a superuser manually")
 
-def collect_static():
-    """Collect static files for production"""
-    print("Collecting static files...")
-    try:
-        execute_from_command_line(['manage.py', 'collectstatic', '--noinput'])
-        print("✅ Static files collected")
-    except Exception as e:
-        print(f"❌ Static file collection failed: {e}")
-        # Don't raise here as this is not critical for basic functionality
-        print("   Continuing without static files...")
-
 if __name__ == "__main__":
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'knowledgeinjester.settings')
     django.setup()
     
     setup_database()
     create_superuser()
-    collect_static()
     
     print("Startup completed successfully!")
