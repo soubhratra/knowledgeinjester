@@ -4,12 +4,18 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install build dependencies (required for madoka and other C extensions)
+# Install full build toolchain and system dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+        build-essential \
         gcc \
         make \
         python3-dev \
+        libffi-dev \
+        libssl-dev \
+        libstdc++6 \
+        libc++1 \
+        libc++abi1 \
     && \
     rm -rf /var/lib/apt/lists/*
 
