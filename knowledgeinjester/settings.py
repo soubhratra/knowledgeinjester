@@ -18,7 +18,10 @@ def _split_env(name, default=""):
 # ---- Static files (important for Unfold styling) ----
 STATIC_URL = "/static/"
 STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')            # collectstatic output
-STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static'),]          # your project-level static folder
+
+# Only add STATICFILES_DIRS if the static directory exists
+static_dir = os.path.join(BASE_DIR, 'static')
+STATICFILES_DIRS = [static_dir] if os.path.exists(static_dir) else []
 
 ENV = os.getenv("ENV", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
