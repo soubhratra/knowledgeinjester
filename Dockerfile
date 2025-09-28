@@ -41,4 +41,4 @@ ENV BUILD_MODE=false
 ENV RUNTIME_MODE=true
 
 # Start the application server
-CMD ["sh", "-c", "python startup.py && uvicorn knowledgeinjester.asgi:application --host 0.0.0.0 --port 8000"]
+CMD ["sh", "-c", "python startup.py && uvicorn knowledgeinjester.asgi:application --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips=*"]
