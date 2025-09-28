@@ -2,28 +2,28 @@
 Test settings for knowledge injester.
 """
 from .settings import *
+import os
 
-# Use in-memory database for faster tests
+# Use PostgreSQL test database for Supabase compatibility
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': ':memory:',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('TEST_DB_NAME', 'test_knowledgeinjester'),
+        'USER': os.getenv('TEST_DB_USER', os.getenv('DB_USER', 'postgres')),
+        'PASSWORD': os.getenv('TEST_DB_PASSWORD', os.getenv('DB_PASSWORD', '')),
+        'HOST': os.getenv('TEST_DB_HOST', os.getenv('DB_HOST', 'localhost')),
+        'PORT': os.getenv('TEST_DB_PORT', os.getenv('DB_PORT', '5432')),
+        'OPTIONS': {'sslmode': 'require'} if os.getenv('TEST_DB_SSL', 'true').lower() == 'true' else {},
     }
 }
 
-# Disable migrations for faster tests
-class DisableMigrations:
-    def __contains__(self, item):
-        return True
-    
-    def __getitem__(self, item):
-        return None
-
-MIGRATION_MODULES = DisableMigrations()
+# Enable migrations for PostgreSQL tests to ensure proper schema
+# MIGRATION_MODULES = DisableMigrations()
 
 # Test-specific settings
 DEBUG = False
 SECRET_KEY = 'test-secret-key-not-for-production'
+TESTING = True
 
 # Disable logging during tests
 LOGGING = {

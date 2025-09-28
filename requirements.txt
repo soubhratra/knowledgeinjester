@@ -5,18 +5,34 @@ uvicorn[standard]>=0.29
 pydantic>=2.6
 openai>=1.40.0
 langgraph>=0.2.0
+langsmith[otel]>=0.4.30
 httpx>=0.27
 python-dotenv>=1.0.0
+tiktoken>=0.7.0
+whitenoise>=6.7.0
+python-decouple>=3.8
+
+# crawling / parsing
 crawl4ai>=0.7.4
+
+# DB + Supabase (we'll use Django's DB to talk to Supabase Postgres directly)
+psycopg[binary]>=3.2.1
+supabase>=2.6.0
+pgvector>=0.2.4
+
+# background jobs (optional but supported)
+celery>=5.4.0
+redis>=5.0.7
+
+# utils
+numpy>=1.26.4
+django-unfold>=0.60.0
+django-cors-headers>=4.3.1
+rav>=0.0.9
+python-json-logger>=2.0.0
 
 # Testing dependencies
 pytest>=7.4.0
 pytest-django>=4.5.0
 pytest-cov>=4.1.0
 pytest-asyncio>=0.21.0
-
-# Add if/when you switch DBs:
-# psycopg[binary]>=3.1
-# supabase>=2.5
-# beautifulsoup4 readability-lxml trafilatura (for crawling/parsing)
-# langfuse>=0.3.0

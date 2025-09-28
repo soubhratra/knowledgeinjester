@@ -45,6 +45,7 @@ def test_organization() -> Organization:
     return Organization.objects.create(
         name="Test Organization",
         slug="test-org",
+        tenant_id="test-tenant-123",
         supabase_url="https://test.supabase.co",
         supabase_anon_key="test-anon-key",
         supabase_service_key="test-service-key"
@@ -52,10 +53,77 @@ def test_organization() -> Organization:
 
 
 @pytest.fixture
+def test_organization_with_custom_prompt() -> Organization:
+    """Create a test organization with custom prompt."""
+    custom_prompt = """You are a specialized medical AI assistant for {organization_name}.
+
+Context:
+{context}
+
+Question: {question}
+
+Instructions:
+- Provide accurate, evidence-based medical information
+- Always recommend consulting with healthcare professionals
+- Cite sources using [1], [2], etc. when referencing medical literature
+
+Sources:
+{sources}
+
+Remember: This information is for educational purposes only."""
+    
+    return Organization.objects.create(
+        name="Medical AI Solutions",
+        slug="medical-ai-solutions",
+        tenant_id="medical-ai-123",
+        custom_prompt=custom_prompt
+    )
+
+
+@pytest.fixture
+def test_organization_with_legal_prompt() -> Organization:
+    """Create a test organization with legal research prompt."""
+    legal_prompt = """You are a legal research assistant for {organization_name}.
+
+Context:
+{context}
+
+Question: {question}
+
+Instructions:
+- Provide precise legal information based on the provided context
+- Cite legal sources using [1], [2], etc. with proper legal citation format
+- Always note that this is not legal advice
+
+Sources:
+{sources}
+
+Disclaimer: This information is for research purposes only."""
+    
+    return Organization.objects.create(
+        name="Legal Research Corp",
+        slug="legal-research-corp",
+        tenant_id="legal-research-456",
+        custom_prompt=legal_prompt
+    )
+
+
+@pytest.fixture
+def test_organization_with_empty_prompt() -> Organization:
+    """Create a test organization with empty custom prompt (uses defaults)."""
+    return Organization.objects.create(
+        name="Default Organization",
+        slug="default-org",
+        tenant_id="default-org-789",
+        custom_prompt=""
+    )
+
+
+@pytest.fixture
 def test_data_source(test_organization: Organization) -> DataSource:
     """Create a test data source."""
     return DataSource.objects.create(
-        organization=test_organization,
+        tenant=test_organization,
         name="Test Website",
         source_type="website",
         config={"url": "https://example.com"}
@@ -146,10 +214,11 @@ class BaseTestCase(TestCase):
         """Set up test data."""
         self.organization = Organization.objects.create(
             name="Test Organization",
-            slug="test-org"
+            slug="test-org",
+            tenant_id="test-tenant-123"
         )
         self.data_source = DataSource.objects.create(
-            organization=self.organization,
+            tenant=self.organization,
             name="Test Website",
             source_type="website",
             config={"url": "https://example.com"}

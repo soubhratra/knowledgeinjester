@@ -4,6 +4,8 @@ Hashing utilities for content idempotency and deduplication.
 import hashlib
 from typing import Union
 
+def sha256_str(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def sha256_hash(content: Union[str, bytes]) -> str:
     """
