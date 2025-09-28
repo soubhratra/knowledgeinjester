@@ -29,7 +29,16 @@ RUN pip install -r requirements.txt
 COPY . .
 
 # ✅ Run collectstatic during the build phase — this is critical on Northflank
+# Set BUILD_MODE to disable file logging during build
+ENV BUILD_MODE=true
 RUN python manage.py collectstatic --noinput
+
+# Create logs directory for runtime file logging
+RUN mkdir -p /app/logs
+
+# Reset environment for runtime (enable file logging)
+ENV BUILD_MODE=false
+ENV RUNTIME_MODE=true
 
 # Start the application server
 CMD ["sh", "-c", "python startup.py && uvicorn knowledgeinjester.asgi:application --host 0.0.0.0 --port 8000"]

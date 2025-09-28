@@ -22,51 +22,68 @@ STATICFILES_DIRS = [os.path.join(BASE_DIR, 'static'),]          # your project-l
 
 ENV = os.getenv("ENV", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+# Check if we're in build mode (no file logging during build)
+IS_BUILD_MODE = os.getenv("BUILD_MODE", "false").lower() == "true"
 
 # Structured JSON Logging Configuration
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'formatters': {
-        'json': {
-            '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
-            'format': '%(asctime)s %(name)s %(levelname)s %(message)s %(pathname)s %(lineno)d %(funcName)s %(process)d %(thread)d'
-        },
-        'verbose': {
-            'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
-            'style': '{',
-        },
-    },
-    'handlers': {
+def get_logging_config():
+    handlers = {
         'console': {
             'class': 'logging.StreamHandler',
             'formatter': 'json' if ENV == 'production' else 'verbose',
+        }
+    }
+    
+    # Only add file handler if not in build mode and logs directory exists
+    if not IS_BUILD_MODE:
+        logs_dir = os.path.join(BASE_DIR, 'logs')
+        if os.path.exists(logs_dir) or os.getenv("RUNTIME_MODE", "false").lower() == "true":
+            handlers['file'] = {
+                'class': 'logging.handlers.RotatingFileHandler',
+                'filename': os.path.join(BASE_DIR, 'logs', 'api.log'),
+                'maxBytes': 1024*1024*10,  # 10MB
+                'backupCount': 5,
+                'formatter': 'json',
+            }
+    
+    # Determine which handlers to use for each logger
+    api_handlers = ['console']
+    if 'file' in handlers:
+        api_handlers.append('file')
+    
+    return {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'formatters': {
+            'json': {
+                '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
+                'format': '%(asctime)s %(name)s %(levelname)s %(message)s %(pathname)s %(lineno)d %(funcName)s %(process)d %(thread)d'
+            },
+            'verbose': {
+                'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
+                'style': '{',
+            },
         },
-        'file': {
-            'class': 'logging.handlers.RotatingFileHandler',
-            'filename': os.path.join(BASE_DIR, 'logs', 'api.log'),
-            'maxBytes': 1024*1024*10,  # 10MB
-            'backupCount': 5,
-            'formatter': 'json',
+        'handlers': handlers,
+        'loggers': {
+            'apps.api': {
+                'handlers': api_handlers,
+                'level': LOG_LEVEL,
+                'propagate': False,
+            },
+            'django': {
+                'handlers': ['console'],
+                'level': 'INFO',
+                'propagate': False,
+            },
         },
-    },
-    'loggers': {
-        'apps.api': {
-            'handlers': ['console', 'file'],
-            'level': LOG_LEVEL,
-            'propagate': False,
-        },
-        'django': {
+        'root': {
             'handlers': ['console'],
-            'level': 'INFO',
-            'propagate': False,
+            'level': LOG_LEVEL,
         },
-    },
-    'root': {
-        'handlers': ['console'],
-        'level': LOG_LEVEL,
-    },
-}
+    }
+
+LOGGING = get_logging_config()
 
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-secret-not-for-prod")
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"
