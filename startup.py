@@ -7,6 +7,18 @@ import os
 import sys
 import django
 from django.core.management import execute_from_command_line
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load environment variables from .env file if it exists (for local development)
+# In production (Northflank), environment variables are set directly
+BASE_DIR = Path(__file__).resolve().parent
+env_file = os.path.join(BASE_DIR, '.env')
+if os.path.exists(env_file):
+    load_dotenv(env_file)
+    print("📁 Loaded environment variables from .env file")
+else:
+    print("🌐 Using environment variables from system (production mode)")
 
 def setup_database():
     """Run database migrations"""

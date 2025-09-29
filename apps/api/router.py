@@ -53,7 +53,7 @@ except ImportError:
         return func
 
 # Activity audit
-from apps.tenants.models import ActivityAudit
+from apps.tenants.models import ActivityAudit, Organization
 
 # Prompt service for organization-specific prompts
 from .services.prompt_service import PromptService
@@ -347,8 +347,7 @@ class AskController:
     def ask(self, request, payload: AskIn):
         """
         Updated: hybrid retrieval (pgvector cosine + FTS) then call LLM.
-        AskIn should have: messages (List[MessageContent]), and optionally tenant_id (str) and citations (bool).
-        If tenant_id is not provided, we default to 'public'.
+        AskIn should have: messages (List[MessageContent]), tenant_id (str), and optionally citations (bool).
         If citations is not provided, we default to True.
         Extracts the latest user message from the messages array.
         """
@@ -363,6 +362,23 @@ class AskController:
                          total_messages=len(payload.messages))
         
         try:
+            # Validate tenant_id exists in the database
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                logger.warning("Invalid tenant_id provided", extra={
+                    'event_type': 'invalid_tenant',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("ask", request_id, duration_ms, "invalid_tenant", tenant_id=tenant_id)
+                return AskOut(
+                    text="Invalid tenant ID. Please contact your administrator.",
+                    role="assistant",
+                    sources=None
+                )
             # Extract the latest user message from the messages array
             user_messages = [msg for msg in payload.messages if msg.role == "user"]
             if not user_messages:

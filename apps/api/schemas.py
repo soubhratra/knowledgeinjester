@@ -8,7 +8,7 @@ class MessageContent(BaseModel):
 
 class AskIn(BaseModel):
     messages: List[MessageContent]
-    tenant_id: Optional[str] = "public"
+    tenant_id: str  # Required - no default
     citations: Optional[bool] = True
 
 class Source(BaseModel):
