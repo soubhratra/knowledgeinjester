@@ -23,7 +23,7 @@ BASE_INSTRUCTIONS = (
     '3) If still helpful, provide widely accepted, high-level general knowledge relevant to the question '
     ' and, if appropriate, ask 1–2 brief clarifying questions.\n'
     '4) If a needed detail is not present in the context, as well as not know by you based on your general knowledge, '
-    ' Use simple first person language to answer the question saying you donot know it and try to ask atleast one clarifying question.\n\n'
+    ' Use simple first person language to answer the question saying you are not sure how this question is related to the context and try to ask atleast one clarifying question.\n\n'
     'SAFETY & SCOPE\n'
     '- Do not diagnose or provide medical/legal/financial advice. For emergencies, instruct users to contact local emergency services or crisis lines.\n'
     '- Avoid collecting sensitive personal data. If the user shares it, respond without storing or requesting more.\n'
@@ -118,4 +118,4 @@ class PromptService:
             question=question
         )
 
-        return final_prompt + cls.SAFETY_INSTRUCTIONS
+        return final_prompt # + cls.SAFETY_INSTRUCTIONS
