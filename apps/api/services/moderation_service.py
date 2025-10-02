@@ -6,7 +6,7 @@ from typing import Dict, Any, Optional
 from openai import OpenAI
 from django.conf import settings
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('apps.api')
 
 
 class ModerationService:

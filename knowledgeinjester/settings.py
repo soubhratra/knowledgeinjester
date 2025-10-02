@@ -1,5 +1,6 @@
 from pathlib import Path
 import os
+import logging
 from dotenv import load_dotenv
 from django.urls import reverse_lazy
 from django.templatetags.static import static
@@ -27,6 +28,27 @@ ENV = os.getenv("ENV", "dev")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 # Check if we're in build mode (no file logging during build)
 IS_BUILD_MODE = os.getenv("BUILD_MODE", "false").lower() == "true"
+
+# Custom formatter for verbose logging with extra fields
+class VerboseWithExtraFormatter(logging.Formatter):
+    def format(self, record):
+        # Get the base formatted message
+        msg = super().format(record)
+        
+        # Add extra fields if they exist
+        if hasattr(record, '__dict__'):
+            extra_fields = []
+            for key, value in record.__dict__.items():
+                if key not in ['name', 'msg', 'args', 'levelname', 'levelno', 'pathname', 'filename', 
+                              'module', 'lineno', 'funcName', 'created', 'msecs', 'relativeCreated', 
+                              'thread', 'threadName', 'processName', 'process', 'getMessage', 'exc_info', 
+                              'exc_text', 'stack_info', 'asctime']:
+                    extra_fields.append(f"{key}={value}")
+            
+            if extra_fields:
+                msg += " | " + " | ".join(extra_fields)
+        
+        return msg
 
 # Structured JSON Logging Configuration
 def get_logging_config():
@@ -63,6 +85,7 @@ def get_logging_config():
                 'format': '%(asctime)s %(name)s %(levelname)s %(message)s %(pathname)s %(lineno)d %(funcName)s %(process)d %(thread)d'
             },
             'verbose': {
+                '()': VerboseWithExtraFormatter,
                 'format': '{levelname} {asctime} {module} {process:d} {thread:d} {message}',
                 'style': '{',
             },
@@ -228,3 +251,29 @@ CORS_ALLOW_HEADERS = [
     'x-csrftoken',
     'x-requested-with',
 ]
+
+# Cache Configuration for Conversation Storage
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'conversation-cache',
+        'TIMEOUT': 3600,  # 1 hour default timeout
+        'OPTIONS': {
+            'MAX_ENTRIES': 1000,  # Maximum number of conversations to store
+            'CULL_FREQUENCY': 3,  # Remove 1/3 of entries when MAX_ENTRIES is reached
+        }
+    },
+    'conversations': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'conversation-storage',
+        'TIMEOUT': 7200,  # 2 hours for conversation storage
+        'OPTIONS': {
+            'MAX_ENTRIES': 50,  # Maximum number of conversations
+            'CULL_FREQUENCY': 4,  # Remove 1/4 of entries when MAX_ENTRIES is reached
+        }
+    }
+}
+
+# Conversation Storage Settings
+CONVERSATION_CACHE_TIMEOUT = 7200  # 2 hours
+CONVERSATION_MAX_ENTRIES = 50

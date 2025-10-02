@@ -1,15 +1,19 @@
 from ninja_extra import NinjaExtraAPI, api_controller, http_get, http_post
 from django.conf import settings
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, ValidationError as PydanticValidationError
 from typing import Dict, Any
 import logging
 import time
 import uuid
 from datetime import datetime
 import traceback
+import json
 
 # keep your existing schemas for ask
-from .schemas import AskIn, AskOut, Source
+from .schemas import (
+    AskIn, AskOut, Source, ConversationSession, ConversationListOut,
+    ConversationStartIn, ConversationContinueIn, ConversationResponse
+)
 
 # NEW: minimal ingest DTOs local to this router to avoid breaking your existing schemas
 class IngestIn(BaseModel):
@@ -59,6 +63,10 @@ from apps.tenants.models import ActivityAudit, Organization
 from .services.prompt_service import PromptService
 # Moderation service for content filtering
 from .services.moderation_service import ModerationService
+# Conversation pipeline with LangGraph history support
+from .services.conversation_pipeline import conversation_pipeline
+# Conversation storage service
+from .services.conversation_storage import conversation_storage
 
 # You previously imported a different graph (for Q/A) here:
 # from .services.langgraph_pipeline import graph
@@ -97,6 +105,103 @@ def log_request_end(endpoint: str, request_id: str, duration_ms: float, status: 
         **kwargs
     }
     logger.info('API request completed', extra=log_data)
+
+def parse_request_data(request, model_class):
+    """
+    Parse request data from either JSON or form data and validate against the model.
+    This handles both Content-Type: application/json and application/x-www-form-urlencoded
+    """
+    try:
+        # Try to parse as JSON first
+        if request.content_type == 'application/json':
+            try:
+                # Ensure we have bytes and decode properly
+                if isinstance(request.body, bytes):
+                    body_str = request.body.decode('utf-8')
+                else:
+                    body_str = str(request.body)
+                
+                data = json.loads(body_str)
+                
+                # Handle case where JSON string contains escaped JSON (double-encoded)
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except json.JSONDecodeError:
+                        pass  # If it's not valid JSON, keep the original string
+                
+                # Ensure data is a dictionary
+                if not isinstance(data, dict):
+                    logger.error("JSON data is not a dictionary", extra={
+                        'content_type': request.content_type,
+                        'body_preview': body_str[:200],
+                        'data_type': type(data).__name__,
+                        'data_value': str(data)[:200]
+                    })
+                    raise ValueError("JSON data must be an object/dictionary")
+                
+                return model_class(**data)
+            except json.JSONDecodeError as e:
+                logger.warning("Failed to parse JSON request body", extra={
+                    'error': str(e),
+                    'content_type': request.content_type,
+                    'body_preview': str(request.body)[:200]
+                })
+                raise ValueError("Invalid JSON format")
+        
+        # Fall back to form data
+        elif request.content_type in ['application/x-www-form-urlencoded', 'multipart/form-data']:
+            data = request.POST.dict()
+            # Convert string values to appropriate types for boolean fields
+            if 'citations' in data:
+                if isinstance(data['citations'], str):
+                    data['citations'] = data['citations'].lower() in ('true', '1', 'yes', 'on')
+            return model_class(**data)
+        
+        # Try to parse as JSON if content type is not specified or is text/plain
+        else:
+            try:
+                # Ensure we have bytes and decode properly
+                if isinstance(request.body, bytes):
+                    body_str = request.body.decode('utf-8')
+                else:
+                    body_str = str(request.body)
+                
+                data = json.loads(body_str)
+                
+                # Handle case where JSON string contains escaped JSON (double-encoded)
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except json.JSONDecodeError:
+                        pass  # If it's not valid JSON, keep the original string
+                
+                # Ensure data is a dictionary
+                if not isinstance(data, dict):
+                    logger.error("JSON data is not a dictionary", extra={
+                        'content_type': request.content_type,
+                        'body_preview': body_str[:200],
+                        'data_type': type(data).__name__,
+                        'data_value': str(data)[:200]
+                    })
+                    raise ValueError("JSON data must be an object/dictionary")
+                
+                return model_class(**data)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Last resort: try form data
+                data = request.POST.dict()
+                if 'citations' in data and isinstance(data['citations'], str):
+                    data['citations'] = data['citations'].lower() in ('true', '1', 'yes', 'on')
+                return model_class(**data)
+                
+    except (ValueError, PydanticValidationError) as e:
+        logger.error("Validation error parsing request data", extra={
+            'error': str(e),
+            'content_type': request.content_type,
+            'body_preview': str(request.body)[:200] if hasattr(request, 'body') else 'No body',
+            'form_data': dict(request.POST) if hasattr(request, 'POST') else 'No POST data'
+        })
+        raise
 
 def log_error(endpoint: str, request_id: str, error: Exception, tenant_id: str = None, **kwargs):
     """Log errors with structured data and stack trace"""
@@ -343,23 +448,24 @@ def process_citations(hits, answer, enable_citations=True):
 @api_controller("v1", tags=["ask"])
 class AskController:
     @http_post("/ask", response=AskOut)
-    @traceable(name="ask_endpoint")
+    @traceable(name="ask_endpoint", exclude_parameters=["request"])
     def ask(self, request, payload: AskIn):
         """
-        Updated: hybrid retrieval (pgvector cosine + FTS) then call LLM.
-        AskIn should have: messages (List[MessageContent]), tenant_id (str), and optionally citations (bool).
-        If citations is not provided, we default to True.
-        Extracts the latest user message from the messages array.
+        Enhanced ask endpoint with server-side conversation history support.
+        Uses conversation storage to maintain context without requiring clients to pass history.
         """
         request_id = str(uuid.uuid4())
         start_time = time.time()
         
         tenant_id = payload.tenant_id
         enable_citations = payload.citations
+        conversation_id = payload.conversation_id
+        user_message = payload.message.strip()
         
         log_request_start("ask", request_id, tenant_id=tenant_id, 
                          enable_citations=enable_citations, 
-                         total_messages=len(payload.messages))
+                         conversation_id=conversation_id,
+                         message_length=len(user_message))
         
         try:
             # Validate tenant_id exists in the database
@@ -377,32 +483,30 @@ class AskController:
                 return AskOut(
                     text="Invalid tenant ID. Please contact your administrator.",
                     role="assistant",
-                    sources=None
+                    sources=None,
+                    conversation_id=conversation_id
                 )
-            # Extract the latest user message from the messages array
-            user_messages = [msg for msg in payload.messages if msg.role == "user"]
-            if not user_messages:
-                log_error("ask", request_id, ValueError("No user message found"), tenant_id=tenant_id)
-                return AskOut(error="No user message found in the messages array.")
             
-            question = user_messages[-1].text.strip()  # Get the latest user message
+            # Validate user message
+            if not user_message:
+                log_error("ask", request_id, ValueError("Empty user message"), tenant_id=tenant_id)
+                return AskOut(error="User message cannot be empty.", conversation_id=conversation_id)
             
             logger.info("Ask request details", extra={
                 'event_type': 'ask_request_details',
                 'request_id': request_id,
                 'tenant_id': tenant_id,
-                'question_length': len(question),
-                'question_preview': question[:100] + "..." if len(question) > 100 else question,
-                'total_messages': len(payload.messages),
-                'user_messages': len(user_messages),
+                'message_length': len(user_message),
+                'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
                 'enable_citations': enable_citations,
+                'conversation_id': conversation_id,
                 'timestamp': datetime.utcnow().isoformat()
             })
 
             # Moderate the question content
             moderation_start = time.time()
             moderation_service = ModerationService()
-            moderation_result = moderation_service.moderate_question(question)
+            moderation_result = moderation_service.moderate_question(user_message)
             moderation_duration = (time.time() - moderation_start) * 1000
             
             log_performance_metric("moderation", moderation_duration, tenant_id=tenant_id)
@@ -413,7 +517,7 @@ class AskController:
                     'request_id': request_id,
                     'tenant_id': tenant_id,
                     'reason': moderation_result['reason'],
-                    'question_preview': question[:100] + "..." if len(question) > 100 else question,
+                    'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
                     'timestamp': datetime.utcnow().isoformat()
                 })
                 
@@ -423,188 +527,66 @@ class AskController:
                 return AskOut(
                     text=moderation_result["response"],
                     role="assistant",
-                    sources=None
+                    sources=None,
+                    conversation_id=conversation_id
                 )
 
-            # Embed question once
-            embedding_start = time.time()
-            qvec = embed_texts([question])[0]
-            embedding_duration = (time.time() - embedding_start) * 1000
+            # Use the conversation pipeline with server-side storage
+            pipeline_start = time.time()
+            result = conversation_pipeline.process_conversation(
+                user_message=user_message,
+                tenant_id=tenant_id,
+                enable_citations=enable_citations,
+                conversation_id=conversation_id
+            )
+            pipeline_duration = (time.time() - pipeline_start) * 1000
             
-            log_performance_metric("embedding", embedding_duration, tenant_id=tenant_id, 
-                                 vector_length=len(qvec))
-
-            # Retrieve hybrid hits
-            search_start = time.time()
-            top_k = getattr(settings, "RETRIEVAL_TOP_K", 6)
-            hits = hybrid_search(tenant_id, question, qvec, top_k=top_k)
-            search_duration = (time.time() - search_start) * 1000
+            log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
+                                 conversation_id=result.get("conversation_id"),
+                                 answer_length=len(result.get("answer", "")))
             
-            log_performance_metric("hybrid_search", search_duration, tenant_id=tenant_id, 
-                                 top_k=top_k, hits_found=len(hits))
-            
-            # Log search results details
-            logger.info("Search results", extra={
-                'event_type': 'search_results',
-                'request_id': request_id,
-                'tenant_id': tenant_id,
-                'hits_found': len(hits),
-                'top_k': top_k,
-                'search_duration_ms': search_duration,
-                'hits_details': [
-                    {
-                        'index': i+1,
-                        'score': hit.get('score'),
-                        'sim': hit.get('sim'),
-                        'fts_rank': hit.get('fts_rank'),
-                        'title': hit.get('title', ''),
-                        'source_url': hit.get('source_url', ''),
-                        'text_length': len(hit.get('text', ''))
-                    }
-                    for i, hit in enumerate(hits)
-                ],
-                'timestamp': datetime.utcnow().isoformat()
-            })
-
-            # Build context based on citations flag
-            context_start = time.time()
-            if enable_citations:
-                # Deduplicate by document (source_url) and create stable source enumeration
-                unique_docs = {}
-                for hit in hits:
-                    source_url = hit.get('source_url', '')
-                    if source_url not in unique_docs:
-                        unique_docs[source_url] = {
-                            'title': hit.get('title', ''),
-                            'url': source_url,
-                            'chunks': []
-                        }
-                    unique_docs[source_url]['chunks'].append(hit.get('text', ''))
-                
-                # Create stable source list (limit to 3-5 most relevant sources)
-                sources = []
-                source_index = 1
-                for source_url, doc_info in list(unique_docs.items())[:5]:
-                    sources.append({
-                        'index': source_index,
-                        'title': doc_info['title'] or source_url,
-                        'url': source_url
-                    })
-                    source_index += 1
-
-                # Build context with stable source numbering
-                context_parts = []
-                for source_url, doc_info in list(unique_docs.items())[:5]:
-                    source_num = next(s['index'] for s in sources if s['url'] == source_url)
-                    # Combine all chunks from the same document
-                    combined_text = '\n\n'.join(doc_info['chunks'])
-                    context_parts.append(f"[{source_num}] {doc_info['title'] or source_url}\n{combined_text}")
-                
-                context = "\n\n".join(context_parts)
-                
-                # Build source list for the prompt
-                source_list = "\n".join([f"[{s['index']}] {s['title']} - {s['url']}" for s in sources])
-
-                # Use organization-specific prompt with fallback to default
-                prompt = PromptService.get_prompt_for_organization(
-                    tenant_id=tenant_id,
-                    enable_citations=enable_citations,
-                    context=context,
-                    question=question,
-                    sources=source_list
-                )
-            else:
-                # Simple context without citations
-                context_parts = []
-                for i, hit in enumerate(hits):
-                    context_parts.append(f"{hit.get('title', '') or hit.get('source_url', '')}\n{hit.get('text', '')}")
-                
-                context = "\n\n".join(context_parts)
-
-                # Use organization-specific prompt with fallback to default
-                prompt = PromptService.get_prompt_for_organization(
-                    tenant_id=tenant_id,
-                    enable_citations=enable_citations,
-                    context=context,
-                    question=question,
-                    sources=""
-                )
-            
-            context_duration = (time.time() - context_start) * 1000
-            
-            logger.info("Context built", extra={
-                'event_type': 'context_built',
-                'request_id': request_id,
-                'tenant_id': tenant_id,
-                'context_length': len(context),
-                'context_duration_ms': context_duration,
-                'citations_enabled': enable_citations,
-                'unique_sources': len(unique_docs) if enable_citations else len(hits),
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            
-            log_performance_metric("context_building", context_duration, tenant_id=tenant_id, 
-                                 context_length=len(context), citations_enabled=enable_citations)
-
-            # Create a traced LLM call
-            llm_start = time.time()
-            if LANGSMITH_AVAILABLE:
-                from langsmith import traceable
-                
-                @traceable(name="llm_chat_completion")
-                def call_llm(prompt_text):
-                    return _llm.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt_text}],
-                        temperature=0.2,
-                    )
-                
-                resp = call_llm(prompt)
-            else:
-                resp = _llm.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                )
-            llm_duration = (time.time() - llm_start) * 1000
-            
-            answer = resp.choices[0].message.content
-            
-            log_performance_metric("llm_completion", llm_duration, tenant_id=tenant_id, 
-                                 model="gpt-4o-mini", answer_length=len(answer))
-
-            # Process citations based on the flag
-            citation_start = time.time()
-            if enable_citations:
-                source_objects, answer = process_citations(hits, answer, enable_citations=True)
-            else:
-                source_objects = None
-            citation_duration = (time.time() - citation_start) * 1000
-            
-            log_performance_metric("citation_processing", citation_duration, tenant_id=tenant_id, 
-                                 citations_enabled=enable_citations, 
-                                 sources_count=len(source_objects) if source_objects else 0)
+            # Convert sources to the expected format
+            source_objects = None
+            if result.get("sources") and enable_citations:
+                source_objects = []
+                for i, source in enumerate(result["sources"], 1):
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        source_objects.append(Source(
+                            index=i,
+                            title=source.get("title", ""),
+                            url=source.get("url", "")
+                        ))
 
             # Log successful completion
             duration_ms = (time.time() - start_time) * 1000
             log_request_end("ask", request_id, duration_ms, "success", 
-                          tenant_id=tenant_id, answer_length=len(answer),
-                          sources_count=len(source_objects) if source_objects else 0)
+                          tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
+                          sources_count=len(source_objects) if source_objects else 0,
+                          conversation_id=result.get("conversation_id"))
             
             log_business_metric("question_answered", tenant_id, 
-                              question_length=len(question),
-                              answer_length=len(answer),
+                              question_length=len(user_message),
+                              answer_length=len(result.get("answer", "")),
                               sources_used=len(source_objects) if source_objects else 0,
-                              citations_enabled=enable_citations)
+                              citations_enabled=enable_citations,
+                              conversation_id=result.get("conversation_id"))
 
-            # Return in the new format with sources only if citations are enabled and present
-            return AskOut(text=answer, role="assistant", sources=source_objects)
+            # Return response with conversation ID
+            return AskOut(
+                text=result.get("answer", ""),
+                role="assistant",
+                sources=source_objects,
+                conversation_id=result.get("conversation_id")
+            )
             
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
             log_error("ask", request_id, e, tenant_id=tenant_id)
             log_request_end("ask", request_id, duration_ms, "error", tenant_id=tenant_id)
-            return AskOut(error=f"Error generating response: {str(e)}")
+            return AskOut(
+                error=f"Error generating response: {str(e)}",
+                conversation_id=conversation_id
+            )
 
 
 @api_controller("v1", tags=["ingest"])
@@ -737,4 +719,462 @@ class IngestController:
                           tenant_id=payload.tenant_id)
             return IngestOut(job_id=-1, docs=0, chunks=0, message=f"error: {e}")
 
-api.register_controllers(MetaController, AskController, IngestController, AdminController)
+
+@api_controller("v1", tags=["conversations"])
+class ConversationController:
+    @http_post("/conversations", response=ConversationResponse)
+    @traceable(name="start_conversation", exclude_parameters=["request"])
+    def start_conversation(self, request):
+        """
+        Start a new conversation with the AI assistant.
+        Returns a conversation_id that can be used for follow-up messages.
+        Handles both JSON and form-encoded request bodies.
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        try:
+            # Parse request data using our robust parser
+            payload = parse_request_data(request, ConversationStartIn)
+            
+            tenant_id = payload.tenant_id
+            enable_citations = payload.citations
+            user_message = payload.message.strip()
+            
+        except (ValueError, PydanticValidationError) as e:
+            logger.error("Validation error in start_conversation", extra={
+                'event_type': 'validation_error',
+                'request_id': request_id,
+                'error': str(e),
+                'content_type': request.content_type,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("start_conversation", request_id, duration_ms, "validation_error")
+            return ConversationResponse(
+                text="",
+                role="assistant",
+                conversation_id="",
+                error=f"Invalid request data: {str(e)}"
+            )
+        
+        log_request_start("start_conversation", request_id, tenant_id=tenant_id, 
+                         enable_citations=enable_citations, 
+                         message_length=len(user_message))
+        
+        try:
+            # Validate tenant_id exists in the database
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                logger.warning("Invalid tenant_id provided", extra={
+                    'event_type': 'invalid_tenant',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "invalid_tenant", tenant_id=tenant_id)
+                return ConversationResponse(
+                    text="Invalid tenant ID. Please contact your administrator.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Invalid tenant ID"
+                )
+            
+            # Validate user message
+            if not user_message:
+                log_error("start_conversation", request_id, ValueError("Empty user message"), tenant_id=tenant_id)
+                return ConversationResponse(
+                    text="",
+                    role="assistant", 
+                    conversation_id="",
+                    error="User message cannot be empty."
+                )
+            
+            logger.info("Start conversation request details", extra={
+                'event_type': 'start_conversation_details',
+                'request_id': request_id,
+                'tenant_id': tenant_id,
+                'message_length': len(user_message),
+                'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                'enable_citations': enable_citations,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+
+            # Moderate the question content
+            moderation_start = time.time()
+            moderation_service = ModerationService()
+            moderation_result = moderation_service.moderate_question(user_message)
+            moderation_duration = (time.time() - moderation_start) * 1000
+            
+            log_performance_metric("moderation", moderation_duration, tenant_id=tenant_id)
+            
+            if not moderation_result["is_appropriate"]:
+                logger.warning("Question flagged by moderation", extra={
+                    'event_type': 'moderation_flagged',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'reason': moderation_result['reason'],
+                    'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "moderation_flagged", 
+                              tenant_id=tenant_id, moderation_reason=moderation_result['reason'])
+                return ConversationResponse(
+                    text=moderation_result["response"],
+                    role="assistant",
+                    conversation_id="",
+                    error="Content flagged by moderation"
+                )
+
+            # Use the conversation pipeline to start a new conversation
+            pipeline_start = time.time()
+            result = conversation_pipeline.process_conversation(
+                user_message=user_message,
+                tenant_id=tenant_id,
+                enable_citations=enable_citations,
+                conversation_id=None  # None means create new conversation
+            )
+            pipeline_duration = (time.time() - pipeline_start) * 1000
+            
+            log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
+                                 conversation_id=result.get("conversation_id"),
+                                 answer_length=len(result.get("answer", "")))
+            
+            # Convert sources to the expected format
+            source_objects = None
+            if result.get("sources") and enable_citations:
+                source_objects = []
+                for i, source in enumerate(result["sources"], 1):
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        source_objects.append(Source(
+                            index=i,
+                            title=source.get("title", ""),
+                            url=source.get("url", "")
+                        ))
+
+            # Log successful completion
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("start_conversation", request_id, duration_ms, "success", 
+                          tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
+                          sources_count=len(source_objects) if source_objects else 0,
+                          conversation_id=result.get("conversation_id"))
+            
+            log_business_metric("conversation_started", tenant_id, 
+                              question_length=len(user_message),
+                              answer_length=len(result.get("answer", "")),
+                              sources_used=len(source_objects) if source_objects else 0,
+                              citations_enabled=enable_citations,
+                              conversation_id=result.get("conversation_id"))
+
+            # Return response with conversation ID
+            return ConversationResponse(
+                text=result.get("answer", ""),
+                role="assistant",
+                conversation_id=result.get("conversation_id", ""),
+                sources=source_objects
+            )
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("start_conversation", request_id, e, tenant_id=tenant_id)
+            log_request_end("start_conversation", request_id, duration_ms, "error", tenant_id=tenant_id)
+            return ConversationResponse(
+                text="",
+                role="assistant",
+                conversation_id="",
+                error=f"Error generating response: {str(e)}"
+            )
+    
+    @http_post("/conversations/{conversation_id}", response=ConversationResponse)
+    @traceable(name="continue_conversation", exclude_parameters=["request"])
+    def continue_conversation(self, request, conversation_id: str):
+        """
+        Continue an existing conversation by sending a new message.
+        The conversation_id should be obtained from a previous conversation response.
+        Handles both JSON and form-encoded request bodies.
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        try:
+            # Parse request data using our robust parser
+            payload = parse_request_data(request, ConversationContinueIn)
+            
+            tenant_id = payload.tenant_id
+            enable_citations = payload.citations
+            user_message = payload.message.strip()
+            
+        except (ValueError, PydanticValidationError) as e:
+            logger.error("Validation error in continue_conversation", extra={
+                'event_type': 'validation_error',
+                'request_id': request_id,
+                'conversation_id': conversation_id,
+                'error': str(e),
+                'content_type': request.content_type,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("continue_conversation", request_id, duration_ms, "validation_error")
+            return ConversationResponse(
+                text="",
+                role="assistant",
+                conversation_id=conversation_id,
+                error=f"Invalid request data: {str(e)}"
+            )
+        
+        log_request_start("continue_conversation", request_id, tenant_id=tenant_id, 
+                         enable_citations=enable_citations, 
+                         conversation_id=conversation_id,
+                         message_length=len(user_message))
+        
+        try:
+            # Validate tenant_id exists in the database
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                logger.warning("Invalid tenant_id provided", extra={
+                    'event_type': 'invalid_tenant',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "invalid_tenant", tenant_id=tenant_id)
+                return ConversationResponse(
+                    text="Invalid tenant ID. Please contact your administrator.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Invalid tenant ID"
+                )
+            
+            # Validate user message
+            if not user_message:
+                log_error("continue_conversation", request_id, ValueError("Empty user message"), tenant_id=tenant_id)
+                return ConversationResponse(
+                    text="",
+                    role="assistant", 
+                    conversation_id=conversation_id,
+                    error="User message cannot be empty."
+                )
+            
+            # Check if conversation exists
+            conversation = conversation_storage.get_conversation(conversation_id, tenant_id)
+            if conversation is None:
+                logger.warning("Conversation not found", extra={
+                    'event_type': 'conversation_not_found',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                return ConversationResponse(
+                    text="Conversation not found. Please start a new conversation.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Conversation not found"
+                )
+            
+            logger.info("Continue conversation request details", extra={
+                'event_type': 'continue_conversation_details',
+                'request_id': request_id,
+                'tenant_id': tenant_id,
+                'conversation_id': conversation_id,
+                'message_length': len(user_message),
+                'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                'enable_citations': enable_citations,
+                'existing_messages': len(conversation.messages),
+                'timestamp': datetime.utcnow().isoformat()
+            })
+
+            # Moderate the question content
+            moderation_start = time.time()
+            moderation_service = ModerationService()
+            moderation_result = moderation_service.moderate_question(user_message)
+            moderation_duration = (time.time() - moderation_start) * 1000
+            
+            log_performance_metric("moderation", moderation_duration, tenant_id=tenant_id)
+            
+            if not moderation_result["is_appropriate"]:
+                logger.warning("Question flagged by moderation", extra={
+                    'event_type': 'moderation_flagged',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'reason': moderation_result['reason'],
+                    'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "moderation_flagged", 
+                              tenant_id=tenant_id, moderation_reason=moderation_result['reason'])
+                return ConversationResponse(
+                    text=moderation_result["response"],
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Content flagged by moderation"
+                )
+
+            # Use the conversation pipeline to continue the conversation
+            pipeline_start = time.time()
+            result = conversation_pipeline.process_conversation(
+                user_message=user_message,
+                tenant_id=tenant_id,
+                enable_citations=enable_citations,
+                conversation_id=conversation_id
+            )
+            pipeline_duration = (time.time() - pipeline_start) * 1000
+            
+            log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
+                                 conversation_id=result.get("conversation_id"),
+                                 answer_length=len(result.get("answer", "")))
+            
+            # Convert sources to the expected format
+            source_objects = None
+            if result.get("sources") and enable_citations:
+                source_objects = []
+                for i, source in enumerate(result["sources"], 1):
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        source_objects.append(Source(
+                            index=i,
+                            title=source.get("title", ""),
+                            url=source.get("url", "")
+                        ))
+
+            # Log successful completion
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("continue_conversation", request_id, duration_ms, "success", 
+                          tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
+                          sources_count=len(source_objects) if source_objects else 0,
+                          conversation_id=result.get("conversation_id"))
+            
+            log_business_metric("conversation_continued", tenant_id, 
+                              question_length=len(user_message),
+                              answer_length=len(result.get("answer", "")),
+                              sources_used=len(source_objects) if source_objects else 0,
+                              citations_enabled=enable_citations,
+                              conversation_id=result.get("conversation_id"))
+
+            # Return response with conversation ID
+            return ConversationResponse(
+                text=result.get("answer", ""),
+                role="assistant",
+                conversation_id=result.get("conversation_id", conversation_id),
+                sources=source_objects
+            )
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("continue_conversation", request_id, e, tenant_id=tenant_id)
+            log_request_end("continue_conversation", request_id, duration_ms, "error", tenant_id=tenant_id)
+            return ConversationResponse(
+                text="",
+                role="assistant",
+                conversation_id=conversation_id,
+                error=f"Error generating response: {str(e)}"
+            )
+    @http_get("/conversations", response=ConversationListOut)
+    def list_conversations(self, request, tenant_id: str, limit: int = 20, offset: int = 0):
+        """
+        List conversation sessions for a tenant using server-side storage.
+        """
+        try:
+            # Validate tenant_id exists
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                return ConversationListOut(conversations=[], total=0)
+            
+            # Get conversations from storage
+            conversations_data = conversation_storage.list_tenant_conversations(tenant_id, limit, offset)
+            
+            # Convert to response format
+            conversations = []
+            for conv in conversations_data:
+                conversations.append(ConversationSession(
+                    conversation_id=conv.conversation_id,
+                    tenant_id=conv.tenant_id,
+                    created_at=datetime.fromtimestamp(conv.created_at).isoformat(),
+                    last_activity=datetime.fromtimestamp(conv.last_activity).isoformat(),
+                    message_count=len(conv.messages)
+                ))
+            
+            logger.info("Listed conversations", extra={
+                'event_type': 'conversations_listed',
+                'tenant_id': tenant_id,
+                'limit': limit,
+                'offset': offset,
+                'total_found': len(conversations),
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+            return ConversationListOut(conversations=conversations, total=len(conversations))
+            
+        except Exception as e:
+            logger.error(f"Error listing conversations: {str(e)}")
+            return ConversationListOut(conversations=[], total=0)
+    
+    @http_post("/conversations/{conversation_id}/clear")
+    def clear_conversation(self, request, conversation_id: str, tenant_id: str):
+        """
+        Clear a conversation session using server-side storage.
+        """
+        try:
+            # Validate tenant_id exists
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                return {"error": "Invalid tenant ID"}
+            
+            # Clear conversation from storage
+            success = conversation_storage.clear_conversation(conversation_id, tenant_id)
+            
+            if success:
+                logger.info("Cleared conversation", extra={
+                    'event_type': 'conversation_cleared',
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                return {"message": "Conversation cleared successfully"}
+            else:
+                return {"error": "Failed to clear conversation"}
+            
+        except Exception as e:
+            logger.error(f"Error clearing conversation: {str(e)}")
+            return {"error": f"Error clearing conversation: {str(e)}"}
+    
+    @http_get("/conversations/stats")
+    def get_conversation_stats(self, request, tenant_id: str):
+        """
+        Get conversation statistics for a tenant.
+        """
+        try:
+            # Validate tenant_id exists
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                return {"error": "Invalid tenant ID"}
+            
+            # Get stats from storage
+            stats = conversation_storage.get_conversation_stats(tenant_id)
+            
+            logger.info("Retrieved conversation stats", extra={
+                'event_type': 'conversation_stats_retrieved',
+                'tenant_id': tenant_id,
+                'stats': stats,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting conversation stats: {str(e)}")
+            return {"error": f"Error getting conversation stats: {str(e)}"}
+
+api.register_controllers(MetaController, AskController, IngestController, AdminController, ConversationController)
