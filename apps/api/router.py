@@ -1,15 +1,22 @@
 from ninja_extra import NinjaExtraAPI, api_controller, http_get, http_post
+from ninja.security import HttpBearer
 from django.conf import settings
-from pydantic import BaseModel, HttpUrl
+from django.http import JsonResponse
+from pydantic import BaseModel, HttpUrl, ValidationError as PydanticValidationError
 from typing import Dict, Any
 import logging
 import time
 import uuid
 from datetime import datetime
 import traceback
+import json
 
 # keep your existing schemas for ask
-from .schemas import AskIn, AskOut, Source
+from .schemas import (
+    AskIn, AskOut, Source, ConversationSession, ConversationListOut,
+    ConversationStartIn, ConversationContinueIn, ConversationResponse,
+    ConversationCreateOut, SessionIn, SessionOut
+)
 
 # NEW: minimal ingest DTOs local to this router to avoid breaking your existing schemas
 class IngestIn(BaseModel):
@@ -53,18 +60,35 @@ except ImportError:
         return func
 
 # Activity audit
-from apps.tenants.models import ActivityAudit, Organization
+from apps.tenants.models import ActivityAudit, Organization, Conversation, Session
 
 # Prompt service for organization-specific prompts
 from .services.prompt_service import PromptService
 # Moderation service for content filtering
 from .services.moderation_service import ModerationService
+# Conversation pipeline with LangGraph history support
+from .services.conversation_pipeline import conversation_pipeline
+# Conversation storage service
+from .services.conversation_storage import conversation_storage
+# JWT service for session management
+from .services.jwt_service import jwt_service
 
 # You previously imported a different graph (for Q/A) here:
 # from .services.langgraph_pipeline import graph
 # We now use build_graph() for ingestion pipeline, and do RAG explicitly for /ask.
 
-api = NinjaExtraAPI(title="KnowledgeInjester API", version="0.1.0")
+# Define optional JWT Bearer authentication for Swagger UI
+class OptionalJWTAuth(HttpBearer):
+    """Optional JWT authentication - used only for Swagger UI documentation"""
+    def authenticate(self, request, token):
+        # This is just for OpenAPI docs - actual validation happens in endpoints
+        return token
+
+api = NinjaExtraAPI(
+    title="KnowledgeInjester API", 
+    version="0.1.0",
+    description="KnowledgeInjester API with JWT-based authentication. Get a token from POST /api/v1/sessions first."
+)
 
 # LLM client
 _llm = OpenAI()
@@ -97,6 +121,103 @@ def log_request_end(endpoint: str, request_id: str, duration_ms: float, status: 
         **kwargs
     }
     logger.info('API request completed', extra=log_data)
+
+def parse_request_data(request, model_class):
+    """
+    Parse request data from either JSON or form data and validate against the model.
+    This handles both Content-Type: application/json and application/x-www-form-urlencoded
+    """
+    try:
+        # Try to parse as JSON first
+        if request.content_type == 'application/json':
+            try:
+                # Ensure we have bytes and decode properly
+                if isinstance(request.body, bytes):
+                    body_str = request.body.decode('utf-8')
+                else:
+                    body_str = str(request.body)
+                
+                data = json.loads(body_str)
+                
+                # Handle case where JSON string contains escaped JSON (double-encoded)
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except json.JSONDecodeError:
+                        pass  # If it's not valid JSON, keep the original string
+                
+                # Ensure data is a dictionary
+                if not isinstance(data, dict):
+                    logger.error("JSON data is not a dictionary", extra={
+                        'content_type': request.content_type,
+                        'body_preview': body_str[:200],
+                        'data_type': type(data).__name__,
+                        'data_value': str(data)[:200]
+                    })
+                    raise ValueError("JSON data must be an object/dictionary")
+                
+                return model_class(**data)
+            except json.JSONDecodeError as e:
+                logger.warning("Failed to parse JSON request body", extra={
+                    'error': str(e),
+                    'content_type': request.content_type,
+                    'body_preview': str(request.body)[:200]
+                })
+                raise ValueError("Invalid JSON format")
+        
+        # Fall back to form data
+        elif request.content_type in ['application/x-www-form-urlencoded', 'multipart/form-data']:
+            data = request.POST.dict()
+            # Convert string values to appropriate types for boolean fields
+            if 'citations' in data:
+                if isinstance(data['citations'], str):
+                    data['citations'] = data['citations'].lower() in ('true', '1', 'yes', 'on')
+            return model_class(**data)
+        
+        # Try to parse as JSON if content type is not specified or is text/plain
+        else:
+            try:
+                # Ensure we have bytes and decode properly
+                if isinstance(request.body, bytes):
+                    body_str = request.body.decode('utf-8')
+                else:
+                    body_str = str(request.body)
+                
+                data = json.loads(body_str)
+                
+                # Handle case where JSON string contains escaped JSON (double-encoded)
+                if isinstance(data, str):
+                    try:
+                        data = json.loads(data)
+                    except json.JSONDecodeError:
+                        pass  # If it's not valid JSON, keep the original string
+                
+                # Ensure data is a dictionary
+                if not isinstance(data, dict):
+                    logger.error("JSON data is not a dictionary", extra={
+                        'content_type': request.content_type,
+                        'body_preview': body_str[:200],
+                        'data_type': type(data).__name__,
+                        'data_value': str(data)[:200]
+                    })
+                    raise ValueError("JSON data must be an object/dictionary")
+                
+                return model_class(**data)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Last resort: try form data
+                data = request.POST.dict()
+                if 'citations' in data and isinstance(data['citations'], str):
+                    data['citations'] = data['citations'].lower() in ('true', '1', 'yes', 'on')
+                return model_class(**data)
+                
+    except (ValueError, PydanticValidationError) as e:
+        logger.error("Validation error parsing request data", extra={
+            'error': str(e),
+            'content_type': request.content_type,
+            'body_preview': str(request.body)[:200] if hasattr(request, 'body') else 'No body',
+            'form_data': dict(request.POST) if hasattr(request, 'POST') else 'No POST data'
+        })
+        raise
 
 def log_error(endpoint: str, request_id: str, error: Exception, tenant_id: str = None, **kwargs):
     """Log errors with structured data and stack trace"""
@@ -343,23 +464,24 @@ def process_citations(hits, answer, enable_citations=True):
 @api_controller("v1", tags=["ask"])
 class AskController:
     @http_post("/ask", response=AskOut)
-    @traceable(name="ask_endpoint")
+    @traceable(name="ask_endpoint", exclude_parameters=["request"])
     def ask(self, request, payload: AskIn):
         """
-        Updated: hybrid retrieval (pgvector cosine + FTS) then call LLM.
-        AskIn should have: messages (List[MessageContent]), tenant_id (str), and optionally citations (bool).
-        If citations is not provided, we default to True.
-        Extracts the latest user message from the messages array.
+        Enhanced ask endpoint with server-side conversation history support.
+        Uses conversation storage to maintain context without requiring clients to pass history.
         """
         request_id = str(uuid.uuid4())
         start_time = time.time()
         
         tenant_id = payload.tenant_id
         enable_citations = payload.citations
+        conversation_id = payload.conversation_id
+        user_message = payload.message.strip()
         
         log_request_start("ask", request_id, tenant_id=tenant_id, 
                          enable_citations=enable_citations, 
-                         total_messages=len(payload.messages))
+                         conversation_id=conversation_id,
+                         message_length=len(user_message))
         
         try:
             # Validate tenant_id exists in the database
@@ -377,32 +499,30 @@ class AskController:
                 return AskOut(
                     text="Invalid tenant ID. Please contact your administrator.",
                     role="assistant",
-                    sources=None
+                    sources=None,
+                    conversation_id=conversation_id
                 )
-            # Extract the latest user message from the messages array
-            user_messages = [msg for msg in payload.messages if msg.role == "user"]
-            if not user_messages:
-                log_error("ask", request_id, ValueError("No user message found"), tenant_id=tenant_id)
-                return AskOut(error="No user message found in the messages array.")
             
-            question = user_messages[-1].text.strip()  # Get the latest user message
+            # Validate user message
+            if not user_message:
+                log_error("ask", request_id, ValueError("Empty user message"), tenant_id=tenant_id)
+                return AskOut(error="User message cannot be empty.", conversation_id=conversation_id)
             
             logger.info("Ask request details", extra={
                 'event_type': 'ask_request_details',
                 'request_id': request_id,
                 'tenant_id': tenant_id,
-                'question_length': len(question),
-                'question_preview': question[:100] + "..." if len(question) > 100 else question,
-                'total_messages': len(payload.messages),
-                'user_messages': len(user_messages),
+                'message_length': len(user_message),
+                'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
                 'enable_citations': enable_citations,
+                'conversation_id': conversation_id,
                 'timestamp': datetime.utcnow().isoformat()
             })
 
             # Moderate the question content
             moderation_start = time.time()
             moderation_service = ModerationService()
-            moderation_result = moderation_service.moderate_question(question)
+            moderation_result = moderation_service.moderate_question(user_message)
             moderation_duration = (time.time() - moderation_start) * 1000
             
             log_performance_metric("moderation", moderation_duration, tenant_id=tenant_id)
@@ -413,7 +533,7 @@ class AskController:
                     'request_id': request_id,
                     'tenant_id': tenant_id,
                     'reason': moderation_result['reason'],
-                    'question_preview': question[:100] + "..." if len(question) > 100 else question,
+                    'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
                     'timestamp': datetime.utcnow().isoformat()
                 })
                 
@@ -423,188 +543,66 @@ class AskController:
                 return AskOut(
                     text=moderation_result["response"],
                     role="assistant",
-                    sources=None
+                    sources=None,
+                    conversation_id=conversation_id
                 )
 
-            # Embed question once
-            embedding_start = time.time()
-            qvec = embed_texts([question])[0]
-            embedding_duration = (time.time() - embedding_start) * 1000
+            # Use the conversation pipeline with server-side storage
+            pipeline_start = time.time()
+            result = conversation_pipeline.process_conversation(
+                user_message=user_message,
+                tenant_id=tenant_id,
+                enable_citations=enable_citations,
+                conversation_id=conversation_id
+            )
+            pipeline_duration = (time.time() - pipeline_start) * 1000
             
-            log_performance_metric("embedding", embedding_duration, tenant_id=tenant_id, 
-                                 vector_length=len(qvec))
-
-            # Retrieve hybrid hits
-            search_start = time.time()
-            top_k = getattr(settings, "RETRIEVAL_TOP_K", 6)
-            hits = hybrid_search(tenant_id, question, qvec, top_k=top_k)
-            search_duration = (time.time() - search_start) * 1000
+            log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
+                                 conversation_id=result.get("conversation_id"),
+                                 answer_length=len(result.get("answer", "")))
             
-            log_performance_metric("hybrid_search", search_duration, tenant_id=tenant_id, 
-                                 top_k=top_k, hits_found=len(hits))
-            
-            # Log search results details
-            logger.info("Search results", extra={
-                'event_type': 'search_results',
-                'request_id': request_id,
-                'tenant_id': tenant_id,
-                'hits_found': len(hits),
-                'top_k': top_k,
-                'search_duration_ms': search_duration,
-                'hits_details': [
-                    {
-                        'index': i+1,
-                        'score': hit.get('score'),
-                        'sim': hit.get('sim'),
-                        'fts_rank': hit.get('fts_rank'),
-                        'title': hit.get('title', ''),
-                        'source_url': hit.get('source_url', ''),
-                        'text_length': len(hit.get('text', ''))
-                    }
-                    for i, hit in enumerate(hits)
-                ],
-                'timestamp': datetime.utcnow().isoformat()
-            })
-
-            # Build context based on citations flag
-            context_start = time.time()
-            if enable_citations:
-                # Deduplicate by document (source_url) and create stable source enumeration
-                unique_docs = {}
-                for hit in hits:
-                    source_url = hit.get('source_url', '')
-                    if source_url not in unique_docs:
-                        unique_docs[source_url] = {
-                            'title': hit.get('title', ''),
-                            'url': source_url,
-                            'chunks': []
-                        }
-                    unique_docs[source_url]['chunks'].append(hit.get('text', ''))
-                
-                # Create stable source list (limit to 3-5 most relevant sources)
-                sources = []
-                source_index = 1
-                for source_url, doc_info in list(unique_docs.items())[:5]:
-                    sources.append({
-                        'index': source_index,
-                        'title': doc_info['title'] or source_url,
-                        'url': source_url
-                    })
-                    source_index += 1
-
-                # Build context with stable source numbering
-                context_parts = []
-                for source_url, doc_info in list(unique_docs.items())[:5]:
-                    source_num = next(s['index'] for s in sources if s['url'] == source_url)
-                    # Combine all chunks from the same document
-                    combined_text = '\n\n'.join(doc_info['chunks'])
-                    context_parts.append(f"[{source_num}] {doc_info['title'] or source_url}\n{combined_text}")
-                
-                context = "\n\n".join(context_parts)
-                
-                # Build source list for the prompt
-                source_list = "\n".join([f"[{s['index']}] {s['title']} - {s['url']}" for s in sources])
-
-                # Use organization-specific prompt with fallback to default
-                prompt = PromptService.get_prompt_for_organization(
-                    tenant_id=tenant_id,
-                    enable_citations=enable_citations,
-                    context=context,
-                    question=question,
-                    sources=source_list
-                )
-            else:
-                # Simple context without citations
-                context_parts = []
-                for i, hit in enumerate(hits):
-                    context_parts.append(f"{hit.get('title', '') or hit.get('source_url', '')}\n{hit.get('text', '')}")
-                
-                context = "\n\n".join(context_parts)
-
-                # Use organization-specific prompt with fallback to default
-                prompt = PromptService.get_prompt_for_organization(
-                    tenant_id=tenant_id,
-                    enable_citations=enable_citations,
-                    context=context,
-                    question=question,
-                    sources=""
-                )
-            
-            context_duration = (time.time() - context_start) * 1000
-            
-            logger.info("Context built", extra={
-                'event_type': 'context_built',
-                'request_id': request_id,
-                'tenant_id': tenant_id,
-                'context_length': len(context),
-                'context_duration_ms': context_duration,
-                'citations_enabled': enable_citations,
-                'unique_sources': len(unique_docs) if enable_citations else len(hits),
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            
-            log_performance_metric("context_building", context_duration, tenant_id=tenant_id, 
-                                 context_length=len(context), citations_enabled=enable_citations)
-
-            # Create a traced LLM call
-            llm_start = time.time()
-            if LANGSMITH_AVAILABLE:
-                from langsmith import traceable
-                
-                @traceable(name="llm_chat_completion")
-                def call_llm(prompt_text):
-                    return _llm.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": prompt_text}],
-                        temperature=0.2,
-                    )
-                
-                resp = call_llm(prompt)
-            else:
-                resp = _llm.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.2,
-                )
-            llm_duration = (time.time() - llm_start) * 1000
-            
-            answer = resp.choices[0].message.content
-            
-            log_performance_metric("llm_completion", llm_duration, tenant_id=tenant_id, 
-                                 model="gpt-4o-mini", answer_length=len(answer))
-
-            # Process citations based on the flag
-            citation_start = time.time()
-            if enable_citations:
-                source_objects, answer = process_citations(hits, answer, enable_citations=True)
-            else:
-                source_objects = None
-            citation_duration = (time.time() - citation_start) * 1000
-            
-            log_performance_metric("citation_processing", citation_duration, tenant_id=tenant_id, 
-                                 citations_enabled=enable_citations, 
-                                 sources_count=len(source_objects) if source_objects else 0)
+            # Convert sources to the expected format
+            source_objects = None
+            if result.get("sources") and enable_citations:
+                source_objects = []
+                for i, source in enumerate(result["sources"], 1):
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        source_objects.append(Source(
+                            index=i,
+                            title=source.get("title", ""),
+                            url=source.get("url", "")
+                        ))
 
             # Log successful completion
             duration_ms = (time.time() - start_time) * 1000
             log_request_end("ask", request_id, duration_ms, "success", 
-                          tenant_id=tenant_id, answer_length=len(answer),
-                          sources_count=len(source_objects) if source_objects else 0)
+                          tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
+                          sources_count=len(source_objects) if source_objects else 0,
+                          conversation_id=result.get("conversation_id"))
             
             log_business_metric("question_answered", tenant_id, 
-                              question_length=len(question),
-                              answer_length=len(answer),
+                              question_length=len(user_message),
+                              answer_length=len(result.get("answer", "")),
                               sources_used=len(source_objects) if source_objects else 0,
-                              citations_enabled=enable_citations)
+                              citations_enabled=enable_citations,
+                              conversation_id=result.get("conversation_id"))
 
-            # Return in the new format with sources only if citations are enabled and present
-            return AskOut(text=answer, role="assistant", sources=source_objects)
+            # Return response with conversation ID
+            return AskOut(
+                text=result.get("answer", ""),
+                role="assistant",
+                sources=source_objects,
+                conversation_id=result.get("conversation_id")
+            )
             
         except Exception as e:
             duration_ms = (time.time() - start_time) * 1000
             log_error("ask", request_id, e, tenant_id=tenant_id)
             log_request_end("ask", request_id, duration_ms, "error", tenant_id=tenant_id)
-            return AskOut(error=f"Error generating response: {str(e)}")
+            return AskOut(
+                error=f"Error generating response: {str(e)}",
+                conversation_id=conversation_id
+            )
 
 
 @api_controller("v1", tags=["ingest"])
@@ -737,4 +735,923 @@ class IngestController:
                           tenant_id=payload.tenant_id)
             return IngestOut(job_id=-1, docs=0, chunks=0, message=f"error: {e}")
 
-api.register_controllers(MetaController, AskController, IngestController, AdminController)
+
+@api_controller("v1", tags=["sessions"])
+class SessionController:
+    @http_post("/sessions", response=SessionOut)
+    @traceable(name="create_session", exclude_parameters=["request"])
+    def create_session(self, request, payload: SessionIn):
+        """
+        Create a new JWT session token (Phase 1).
+        
+        Phase 1 Security:
+        - Validates siteKey and Origin
+        - Returns JWT token bound to the origin
+        - Token can be used for subsequent conversation requests
+        
+        Headers Required:
+        - Origin: https://... (required, must be HTTPS and in allowed_origins)
+        
+        Returns:
+        - JWT token with claims: {sid, tid, skey, org, env, iat, exp}
+        - Session metadata
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        site_key = payload.siteKey
+        origin = request.META.get('HTTP_ORIGIN', '')
+        ip_address = jwt_service.get_client_ip(request)
+        
+        log_request_start("create_session", request_id, site_key=site_key, origin=origin)
+        
+        try:
+            # 1. Validate Origin header (must be HTTPS, except localhost in development)
+            if not origin:
+                logger.warning("Missing Origin header in session request", extra={
+                    'event_type': 'missing_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "missing_origin")
+                return JsonResponse({"error": "Origin header is required"}, status=403)
+            
+            # Allow HTTP for localhost/127.0.0.1 in development
+            is_localhost = any(host in origin for host in ['localhost', '127.0.0.1'])
+            if not origin.startswith('https://') and not (is_localhost and origin.startswith('http://')):
+                logger.warning("Non-HTTPS origin rejected", extra={
+                    'event_type': 'non_https_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id='unknown',
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'non_https_origin',
+                        'site_key': site_key
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "non_https_origin")
+                return JsonResponse({"error": "Only HTTPS origins are allowed"}, status=403)
+            
+            # 2. Look up Site by siteKey
+            try:
+                organization = Organization.objects.get(site_key=site_key, status='active')
+            except Organization.DoesNotExist:
+                logger.warning("Invalid or disabled site_key", extra={
+                    'event_type': 'invalid_site_key',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "invalid_site_key")
+                return JsonResponse({"error": "Invalid or disabled site key"}, status=404)
+            
+            # 3. Check if Origin is in allowed_origins
+            if not organization.is_origin_allowed(origin):
+                logger.warning("Origin not allowed for site", extra={
+                    'event_type': 'origin_not_allowed',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'allowed_origins': organization.allowed_origins,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id=organization.tenant_id,
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'origin_not_allowed',
+                        'site_key': site_key,
+                        'allowed_origins': organization.allowed_origins
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "origin_not_allowed")
+                return JsonResponse({"error": "Origin not allowed for this site"}, status=403)
+            
+            # 4. Generate JWT token
+            token_data = jwt_service.generate_token(
+                tenant_id=organization.tenant_id,
+                site_key=site_key,
+                origin=origin,
+                env=organization.env
+            )
+            
+            # 5. Store session in database
+            from django.utils.dateparse import parse_datetime
+            session = Session.objects.create(
+                session_id=token_data['session_id'],
+                organization=organization,
+                tenant_id=organization.tenant_id,
+                site_key=site_key,
+                origin=origin,
+                ip_address=ip_address,
+                expires_at=parse_datetime(token_data['expires_at'])
+            )
+            
+            # 6. Audit session creation
+            ActivityAudit.objects.create(
+                tenant_id=organization.tenant_id,
+                site_key=site_key,
+                activity_type='session_created',
+                performed_by='system',
+                origin=origin,
+                ip_address=ip_address,
+                details={
+                    'session_id': token_data['session_id'],
+                    'expires_at': token_data['expires_at'],
+                    'page_url_hash': payload.pageUrlHash,
+                    'nonce': payload.nonce
+                }
+            )
+            
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("create_session", request_id, duration_ms, "success",
+                          tenant_id=organization.tenant_id, session_id=token_data['session_id'])
+            
+            log_business_metric("session_created", organization.tenant_id,
+                              site_key=site_key, origin=origin,
+                              session_id=token_data['session_id'])
+            
+            return SessionOut(
+                token=token_data['token'],
+                session_id=token_data['session_id'],
+                expires_in=token_data['expires_in'],
+                expires_at=token_data['expires_at']
+            )
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("create_session", request_id, e, site_key=site_key)
+            log_request_end("create_session", request_id, duration_ms, "error")
+            return JsonResponse({"error": f"Error creating session: {str(e)}"}, status=500)
+
+
+@api_controller("v1", tags=["conversations"])
+class ConversationController:
+    @http_post("/conversations", response=ConversationResponse)
+    @traceable(name="start_conversation", exclude_parameters=["request"])
+    def start_conversation(self, request, payload: ConversationStartIn):
+        """
+        Start a new conversation with the AI assistant (Phase 0: siteKey + Origin).
+        
+        Phase 0 Security:
+        - Validates siteKey and Origin
+        - Creates conversation bound to origin
+        - Stores conversation in database for origin validation on continue
+        
+        Headers Required:
+        - Origin: https://... (required, must be HTTPS and in allowed_origins)
+        - Authorization: Bearer <token> (optional, JWT token from /sessions)
+        
+        Body:
+        - siteKey: Public site key
+        - message: User's first message
+        - citations: Optional, whether to include citations
+        - pageUrlHash: Optional telemetry
+        - nonce: Optional client nonce
+        
+        Returns:
+        - conversation_id: Unique conversation identifier
+        - Full response with answer and sources
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        origin = request.META.get('HTTP_ORIGIN', '')
+        ip_address = jwt_service.get_client_ip(request)
+        
+        # Extract data from payload (already parsed by Django Ninja)
+        site_key = payload.siteKey
+        enable_citations = payload.citations
+        user_message = payload.message.strip()
+        
+        # Validate message is not empty
+        if not user_message:
+            return ConversationResponse(
+                text="Message cannot be empty.",
+                role="assistant",
+                conversation_id="",
+                error="Empty message"
+            )
+        
+        log_request_start("start_conversation", request_id, site_key=site_key,
+                         origin=origin, enable_citations=enable_citations, 
+                         message_length=len(user_message))
+        
+        try:
+            # 1. Validate Origin header (must be HTTPS)
+            if not origin:
+                logger.warning("Missing Origin header in conversation request", extra={
+                    'event_type': 'missing_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "missing_origin")
+                return ConversationResponse(
+                    text="Origin header is required for security.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Missing Origin header"
+                )
+            
+            # Allow HTTP for localhost/127.0.0.1 in development
+            is_localhost = any(host in origin for host in ['localhost', '127.0.0.1'])
+            if not origin.startswith('https://') and not (is_localhost and origin.startswith('http://')):
+                logger.warning("Non-HTTPS origin rejected", extra={
+                    'event_type': 'non_https_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id='unknown',
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'non_https_origin',
+                        'endpoint': 'start_conversation'
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "non_https_origin")
+                return ConversationResponse(
+                    text="Only HTTPS origins are allowed for security.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Non-HTTPS origin"
+                )
+            
+            # 2. Look up Site by siteKey and validate status
+            try:
+                organization = Organization.objects.get(site_key=site_key, status='active')
+            except Organization.DoesNotExist:
+                logger.warning("Invalid or disabled site_key", extra={
+                    'event_type': 'invalid_site_key',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "invalid_site_key")
+                return ConversationResponse(
+                    text="Invalid or disabled site key. Please contact your administrator.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Invalid site key"
+                )
+            
+            # 3. Check if Origin is in allowed_origins
+            if not organization.is_origin_allowed(origin):
+                logger.warning("Origin not allowed for site", extra={
+                    'event_type': 'origin_not_allowed',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'allowed_origins': organization.allowed_origins,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id=organization.tenant_id,
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'origin_not_allowed',
+                        'endpoint': 'start_conversation',
+                        'allowed_origins': organization.allowed_origins
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "origin_not_allowed")
+                return ConversationResponse(
+                    text="Your domain is not authorized for this site. Please contact your administrator.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Origin not allowed"
+                )
+            
+            tenant_id = organization.tenant_id
+            
+            # Validate user message
+            if not user_message:
+                log_error("start_conversation", request_id, ValueError("Empty user message"), tenant_id=tenant_id)
+                return ConversationResponse(
+                    text="",
+                    role="assistant", 
+                    conversation_id="",
+                    error="User message cannot be empty."
+                )
+            
+            logger.info("Start conversation request details", extra={
+                'event_type': 'start_conversation_details',
+                'request_id': request_id,
+                'tenant_id': tenant_id,
+                'message_length': len(user_message),
+                'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                'enable_citations': enable_citations,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+
+            # Moderate the question content
+            moderation_start = time.time()
+            moderation_service = ModerationService()
+            moderation_result = moderation_service.moderate_question(user_message)
+            moderation_duration = (time.time() - moderation_start) * 1000
+            
+            log_performance_metric("moderation", moderation_duration, tenant_id=tenant_id)
+            
+            if not moderation_result["is_appropriate"]:
+                logger.warning("Question flagged by moderation", extra={
+                    'event_type': 'moderation_flagged',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'reason': moderation_result['reason'],
+                    'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "moderation_flagged", 
+                              tenant_id=tenant_id, moderation_reason=moderation_result['reason'])
+                return ConversationResponse(
+                    text=moderation_result["response"],
+                    role="assistant",
+                    conversation_id="",
+                    error="Content flagged by moderation"
+                )
+
+            # Use the conversation pipeline to start a new conversation
+            pipeline_start = time.time()
+            result = conversation_pipeline.process_conversation(
+                user_message=user_message,
+                tenant_id=tenant_id,
+                enable_citations=enable_citations,
+                conversation_id=None  # None means create new conversation
+            )
+            pipeline_duration = (time.time() - pipeline_start) * 1000
+            
+            log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
+                                 conversation_id=result.get("conversation_id"),
+                                 answer_length=len(result.get("answer", "")))
+            
+            # 4. Create Conversation record in database
+            conversation_id = result.get("conversation_id", "")
+            try:
+                conversation = Conversation.objects.create(
+                    conversation_id=conversation_id,
+                    organization=organization,
+                    tenant_id=tenant_id,
+                    site_key=site_key,
+                    origin=origin,
+                    ip_address=ip_address,
+                    page_url_hash=payload.pageUrlHash or "",
+                    nonce=payload.nonce or "",
+                    message_count=1,  # First message
+                    metadata={
+                        'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+                        'referer': request.META.get('HTTP_REFERER', ''),
+                    }
+                )
+                
+                # Audit conversation creation
+                ActivityAudit.objects.create(
+                    tenant_id=tenant_id,
+                    site_key=site_key,
+                    activity_type='conversation_started',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'conversation_id': conversation_id,
+                        'page_url_hash': payload.pageUrlHash,
+                        'nonce': payload.nonce
+                    }
+                )
+            except Exception as db_error:
+                # Log but don't fail the request if DB insert fails
+                logger.error("Failed to create conversation record", extra={
+                    'event_type': 'conversation_db_error',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'error': str(db_error),
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            # Convert sources to the expected format
+            source_objects = None
+            if result.get("sources") and enable_citations:
+                source_objects = []
+                for i, source in enumerate(result["sources"], 1):
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        source_objects.append(Source(
+                            index=i,
+                            title=source.get("title", ""),
+                            url=source.get("url", "")
+                        ))
+
+            # Log successful completion
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("start_conversation", request_id, duration_ms, "success", 
+                          tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
+                          sources_count=len(source_objects) if source_objects else 0,
+                          conversation_id=conversation_id)
+            
+            log_business_metric("conversation_started", tenant_id, 
+                              question_length=len(user_message),
+                              answer_length=len(result.get("answer", "")),
+                              sources_used=len(source_objects) if source_objects else 0,
+                              citations_enabled=enable_citations,
+                              conversation_id=conversation_id,
+                              site_key=site_key,
+                              origin=origin)
+
+            # Return response with conversation ID
+            return ConversationResponse(
+                text=result.get("answer", ""),
+                role="assistant",
+                conversation_id=result.get("conversation_id", ""),
+                sources=source_objects
+            )
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("start_conversation", request_id, e, tenant_id=tenant_id)
+            log_request_end("start_conversation", request_id, duration_ms, "error", tenant_id=tenant_id)
+            return ConversationResponse(
+                text="",
+                role="assistant",
+                conversation_id="",
+                error=f"Error generating response: {str(e)}"
+            )
+    
+    @http_post("/conversations/{conversation_id}", response=ConversationResponse)
+    @traceable(name="continue_conversation", exclude_parameters=["request"])
+    def continue_conversation(self, request, conversation_id: str, payload: ConversationContinueIn):
+        """
+        Continue an existing conversation by sending a new message (Phase 0/1: Origin + JWT validation).
+        
+        Phase 0 Security:
+        - Validates Origin matches the stored conversation origin
+        - Derives tenant_id from conversation (no client-provided tenant_id)
+        
+        Phase 1 Security (Optional):
+        - Validates JWT token if provided in Authorization header
+        - Checks token origin matches request origin
+        
+        Headers Required:
+        - Origin: https://... (required, must match conversation origin)
+        - Authorization: Bearer <token> (optional for Phase 1)
+        
+        Body:
+        - message: User's message
+        - citations: Optional, whether to include citations
+        
+        Returns:
+        - Full response with answer and sources
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        origin = request.META.get('HTTP_ORIGIN', '')
+        ip_address = jwt_service.get_client_ip(request)
+        authorization = request.META.get('HTTP_AUTHORIZATION', '')
+        
+        # Extract data from payload (already parsed by Django Ninja)
+        enable_citations = payload.citations
+        user_message = payload.message.strip()
+        
+        # Validate message is not empty
+        if not user_message:
+            return ConversationResponse(
+                text="Message cannot be empty.",
+                role="assistant",
+                conversation_id=conversation_id,
+                error="Empty message"
+            )
+        
+        log_request_start("continue_conversation", request_id, conversation_id=conversation_id,
+                         origin=origin, enable_citations=enable_citations, 
+                         message_length=len(user_message), has_token=bool(authorization))
+        
+        try:
+            # 1. Validate Origin header (must be HTTPS)
+            if not origin:
+                logger.warning("Missing Origin header in continue conversation", extra={
+                    'event_type': 'missing_origin',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "missing_origin")
+                return ConversationResponse(
+                    text="Origin header is required for security.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Missing Origin header"
+                )
+            
+            # Allow HTTP for localhost/127.0.0.1 in development
+            is_localhost = any(host in origin for host in ['localhost', '127.0.0.1'])
+            if not origin.startswith('https://') and not (is_localhost and origin.startswith('http://')):
+                logger.warning("Non-HTTPS origin rejected", extra={
+                    'event_type': 'non_https_origin',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "non_https_origin")
+                return ConversationResponse(
+                    text="Only HTTPS origins are allowed for security.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Non-HTTPS origin"
+                )
+            
+            # 2. Load Conversation from database
+            try:
+                conversation = Conversation.objects.get(conversation_id=conversation_id)
+            except Conversation.DoesNotExist:
+                logger.warning("Conversation not found in database", extra={
+                    'event_type': 'conversation_not_found',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "conversation_not_found")
+                return ConversationResponse(
+                    text="Conversation not found. Please start a new conversation.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Conversation not found"
+                )
+            
+            # 3. Enforce Origin === conversation.origin (strict security)
+            if origin != conversation.origin:
+                logger.warning("Origin mismatch in continue conversation", extra={
+                    'event_type': 'origin_mismatch',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'request_origin': origin,
+                    'conversation_origin': conversation.origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked request
+                ActivityAudit.objects.create(
+                    tenant_id=conversation.tenant_id,
+                    site_key=conversation.site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'origin_mismatch',
+                        'endpoint': 'continue_conversation',
+                        'conversation_id': conversation_id,
+                        'expected_origin': conversation.origin
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "origin_mismatch")
+                return ConversationResponse(
+                    text="Origin mismatch. This conversation is bound to a different origin.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Origin mismatch"
+                )
+            
+            # 4. Phase 1: Validate JWT token if provided (optional)
+            if authorization:
+                token = jwt_service.extract_bearer_token(authorization)
+                if token:
+                    try:
+                        payload = jwt_service.verify_token(token, expected_origin=origin)
+                        
+                        # Verify token site_key matches conversation site_key
+                        if payload.get('skey') != conversation.site_key:
+                            logger.warning("Token site_key mismatch", extra={
+                                'event_type': 'token_site_key_mismatch',
+                                'request_id': request_id,
+                                'conversation_id': conversation_id,
+                                'token_site_key': payload.get('skey'),
+                                'conversation_site_key': conversation.site_key,
+                                'timestamp': datetime.utcnow().isoformat()
+                            })
+                            duration_ms = (time.time() - start_time) * 1000
+                            log_request_end("continue_conversation", request_id, duration_ms, "token_site_key_mismatch")
+                            return ConversationResponse(
+                                text="Token does not match conversation.",
+                                role="assistant",
+                                conversation_id=conversation_id,
+                                error="Token mismatch"
+                            )
+                        
+                        # Update session usage
+                        try:
+                            session = Session.objects.get(session_id=payload.get('sid'))
+                            session.request_count += 1
+                            session.save(update_fields=['request_count', 'last_used_at'])
+                        except Session.DoesNotExist:
+                            pass  # Session might be expired or deleted
+                        
+                    except Exception as jwt_error:
+                        logger.warning("JWT validation failed", extra={
+                            'event_type': 'jwt_validation_failed',
+                            'request_id': request_id,
+                            'conversation_id': conversation_id,
+                            'error': str(jwt_error),
+                            'timestamp': datetime.utcnow().isoformat()
+                        })
+                        duration_ms = (time.time() - start_time) * 1000
+                        log_request_end("continue_conversation", request_id, duration_ms, "jwt_invalid")
+                        return ConversationResponse(
+                            text="Invalid or expired token.",
+                            role="assistant",
+                            conversation_id=conversation_id,
+                            error="Invalid token"
+                        )
+            
+            # Derive tenant_id from conversation (never trust client)
+            tenant_id = conversation.tenant_id
+            
+            # Validate user message
+            if not user_message:
+                log_error("continue_conversation", request_id, ValueError("Empty user message"), tenant_id=tenant_id)
+                return ConversationResponse(
+                    text="",
+                    role="assistant", 
+                    conversation_id=conversation_id,
+                    error="User message cannot be empty."
+                )
+            
+            # Check if conversation exists in in-memory storage
+            conversation_storage_data = conversation_storage.get_conversation(conversation_id, tenant_id)
+            if conversation_storage_data is None:
+                logger.warning("Conversation not found in storage", extra={
+                    'event_type': 'conversation_not_in_storage',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                # Note: Conversation exists in DB but not in cache, this is OK
+                # The conversation_pipeline will handle this
+            
+            logger.info("Continue conversation request details", extra={
+                'event_type': 'continue_conversation_details',
+                'request_id': request_id,
+                'tenant_id': tenant_id,
+                'site_key': conversation.site_key,
+                'conversation_id': conversation_id,
+                'message_length': len(user_message),
+                'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                'enable_citations': enable_citations,
+                'existing_messages': conversation_storage_data.messages if conversation_storage_data else 0,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+
+            # Moderate the question content
+            moderation_start = time.time()
+            moderation_service = ModerationService()
+            moderation_result = moderation_service.moderate_question(user_message)
+            moderation_duration = (time.time() - moderation_start) * 1000
+            
+            log_performance_metric("moderation", moderation_duration, tenant_id=tenant_id)
+            
+            if not moderation_result["is_appropriate"]:
+                logger.warning("Question flagged by moderation", extra={
+                    'event_type': 'moderation_flagged',
+                    'request_id': request_id,
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'reason': moderation_result['reason'],
+                    'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "moderation_flagged", 
+                              tenant_id=tenant_id, moderation_reason=moderation_result['reason'])
+                return ConversationResponse(
+                    text=moderation_result["response"],
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Content flagged by moderation"
+                )
+
+            # Use the conversation pipeline to continue the conversation
+            pipeline_start = time.time()
+            result = conversation_pipeline.process_conversation(
+                user_message=user_message,
+                tenant_id=tenant_id,
+                enable_citations=enable_citations,
+                conversation_id=conversation_id
+            )
+            pipeline_duration = (time.time() - pipeline_start) * 1000
+            
+            log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
+                                 conversation_id=result.get("conversation_id"),
+                                 answer_length=len(result.get("answer", "")))
+            
+            # 5. Update message count in Conversation model
+            try:
+                conversation.message_count += 1
+                conversation.save(update_fields=['message_count', 'last_seen_at'])
+            except Exception as db_error:
+                logger.error("Failed to update conversation message count", extra={
+                    'event_type': 'conversation_update_error',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'error': str(db_error),
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
+            # Convert sources to the expected format
+            source_objects = None
+            if result.get("sources") and enable_citations:
+                source_objects = []
+                for i, source in enumerate(result["sources"], 1):
+                    if isinstance(source, dict) and "title" in source and "url" in source:
+                        source_objects.append(Source(
+                            index=i,
+                            title=source.get("title", ""),
+                            url=source.get("url", "")
+                        ))
+
+            # Log successful completion
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("continue_conversation", request_id, duration_ms, "success", 
+                          tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
+                          sources_count=len(source_objects) if source_objects else 0,
+                          conversation_id=result.get("conversation_id"))
+            
+            log_business_metric("conversation_continued", tenant_id, 
+                              question_length=len(user_message),
+                              answer_length=len(result.get("answer", "")),
+                              sources_used=len(source_objects) if source_objects else 0,
+                              citations_enabled=enable_citations,
+                              conversation_id=result.get("conversation_id"))
+
+            # Return response with conversation ID
+            return ConversationResponse(
+                text=result.get("answer", ""),
+                role="assistant",
+                conversation_id=result.get("conversation_id", conversation_id),
+                sources=source_objects
+            )
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("continue_conversation", request_id, e, tenant_id=tenant_id)
+            log_request_end("continue_conversation", request_id, duration_ms, "error", tenant_id=tenant_id)
+            return ConversationResponse(
+                text="",
+                role="assistant",
+                conversation_id=conversation_id,
+                error=f"Error generating response: {str(e)}"
+            )
+    @http_get("/conversations", response=ConversationListOut)
+    def list_conversations(self, request, tenant_id: str, limit: int = 20, offset: int = 0):
+        """
+        List conversation sessions for a tenant using server-side storage.
+        """
+        try:
+            # Validate tenant_id exists
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                return ConversationListOut(conversations=[], total=0)
+            
+            # Get conversations from storage
+            conversations_data = conversation_storage.list_tenant_conversations(tenant_id, limit, offset)
+            
+            # Convert to response format
+            conversations = []
+            for conv in conversations_data:
+                conversations.append(ConversationSession(
+                    conversation_id=conv.conversation_id,
+                    tenant_id=conv.tenant_id,
+                    created_at=datetime.fromtimestamp(conv.created_at).isoformat(),
+                    last_activity=datetime.fromtimestamp(conv.last_activity).isoformat(),
+                    message_count=len(conv.messages)
+                ))
+            
+            logger.info("Listed conversations", extra={
+                'event_type': 'conversations_listed',
+                'tenant_id': tenant_id,
+                'limit': limit,
+                'offset': offset,
+                'total_found': len(conversations),
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+            return ConversationListOut(conversations=conversations, total=len(conversations))
+            
+        except Exception as e:
+            logger.error(f"Error listing conversations: {str(e)}")
+            return ConversationListOut(conversations=[], total=0)
+    
+    @http_post("/conversations/{conversation_id}/clear")
+    def clear_conversation(self, request, conversation_id: str, tenant_id: str):
+        """
+        Clear a conversation session using server-side storage.
+        """
+        try:
+            # Validate tenant_id exists
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                return {"error": "Invalid tenant ID"}
+            
+            # Clear conversation from storage
+            success = conversation_storage.clear_conversation(conversation_id, tenant_id)
+            
+            if success:
+                logger.info("Cleared conversation", extra={
+                    'event_type': 'conversation_cleared',
+                    'tenant_id': tenant_id,
+                    'conversation_id': conversation_id,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                return {"message": "Conversation cleared successfully"}
+            else:
+                return {"error": "Failed to clear conversation"}
+            
+        except Exception as e:
+            logger.error(f"Error clearing conversation: {str(e)}")
+            return {"error": f"Error clearing conversation: {str(e)}"}
+    
+    @http_get("/conversations/stats")
+    def get_conversation_stats(self, request, tenant_id: str):
+        """
+        Get conversation statistics for a tenant.
+        """
+        try:
+            # Validate tenant_id exists
+            try:
+                organization = Organization.objects.get(tenant_id=tenant_id)
+            except Organization.DoesNotExist:
+                return {"error": "Invalid tenant ID"}
+            
+            # Get stats from storage
+            stats = conversation_storage.get_conversation_stats(tenant_id)
+            
+            logger.info("Retrieved conversation stats", extra={
+                'event_type': 'conversation_stats_retrieved',
+                'tenant_id': tenant_id,
+                'stats': stats,
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"Error getting conversation stats: {str(e)}")
+            return {"error": f"Error getting conversation stats: {str(e)}"}
+
+api.register_controllers(MetaController, AskController, IngestController, AdminController, SessionController, ConversationController)
