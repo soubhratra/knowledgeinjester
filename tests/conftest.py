@@ -42,14 +42,20 @@ def temp_markdown_dir() -> Generator[Path, None, None]:
 @pytest.fixture
 def test_organization() -> Organization:
     """Create a test organization."""
-    return Organization.objects.create(
+    org = Organization.objects.create(
         name="Test Organization",
         slug="test-org",
         tenant_id="test-tenant-123",
+        site_key="pub_testorg_test1234",
+        allowed_origins=["https://testserver", "https://localhost:3000"],
+        domain="testserver",
+        status="active",
+        env="dev",
         supabase_url="https://test.supabase.co",
         supabase_anon_key="test-anon-key",
         supabase_service_key="test-service-key"
     )
+    return org
 
 
 @pytest.fixture
@@ -72,12 +78,18 @@ Sources:
 
 Remember: This information is for educational purposes only."""
     
-    return Organization.objects.create(
+    org = Organization.objects.create(
         name="Medical AI Solutions",
         slug="medical-ai-solutions",
         tenant_id="medical-ai-123",
+        site_key="pub_medicalai_med12345",
+        allowed_origins=["https://testserver"],
+        domain="medical.com",
+        status="active",
+        env="dev",
         custom_prompt=custom_prompt
     )
+    return org
 
 
 @pytest.fixture
@@ -100,23 +112,35 @@ Sources:
 
 Disclaimer: This information is for research purposes only."""
     
-    return Organization.objects.create(
+    org = Organization.objects.create(
         name="Legal Research Corp",
         slug="legal-research-corp",
         tenant_id="legal-research-456",
+        site_key="pub_legalcorp_leg45678",
+        allowed_origins=["https://testserver"],
+        domain="legal.com",
+        status="active",
+        env="dev",
         custom_prompt=legal_prompt
     )
+    return org
 
 
 @pytest.fixture
 def test_organization_with_empty_prompt() -> Organization:
     """Create a test organization with empty custom prompt (uses defaults)."""
-    return Organization.objects.create(
+    org = Organization.objects.create(
         name="Default Organization",
         slug="default-org",
         tenant_id="default-org-789",
+        site_key="pub_defaultorg_def78901",
+        allowed_origins=["https://testserver"],
+        domain="default.com",
+        status="active",
+        env="dev",
         custom_prompt=""
     )
+    return org
 
 
 @pytest.fixture

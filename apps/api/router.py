@@ -1,5 +1,7 @@
 from ninja_extra import NinjaExtraAPI, api_controller, http_get, http_post
+from ninja.security import HttpBearer
 from django.conf import settings
+from django.http import JsonResponse
 from pydantic import BaseModel, HttpUrl, ValidationError as PydanticValidationError
 from typing import Dict, Any
 import logging
@@ -12,7 +14,8 @@ import json
 # keep your existing schemas for ask
 from .schemas import (
     AskIn, AskOut, Source, ConversationSession, ConversationListOut,
-    ConversationStartIn, ConversationContinueIn, ConversationResponse
+    ConversationStartIn, ConversationContinueIn, ConversationResponse,
+    ConversationCreateOut, SessionIn, SessionOut
 )
 
 # NEW: minimal ingest DTOs local to this router to avoid breaking your existing schemas
@@ -57,7 +60,7 @@ except ImportError:
         return func
 
 # Activity audit
-from apps.tenants.models import ActivityAudit, Organization
+from apps.tenants.models import ActivityAudit, Organization, Conversation, Session
 
 # Prompt service for organization-specific prompts
 from .services.prompt_service import PromptService
@@ -67,12 +70,25 @@ from .services.moderation_service import ModerationService
 from .services.conversation_pipeline import conversation_pipeline
 # Conversation storage service
 from .services.conversation_storage import conversation_storage
+# JWT service for session management
+from .services.jwt_service import jwt_service
 
 # You previously imported a different graph (for Q/A) here:
 # from .services.langgraph_pipeline import graph
 # We now use build_graph() for ingestion pipeline, and do RAG explicitly for /ask.
 
-api = NinjaExtraAPI(title="KnowledgeInjester API", version="0.1.0")
+# Define optional JWT Bearer authentication for Swagger UI
+class OptionalJWTAuth(HttpBearer):
+    """Optional JWT authentication - used only for Swagger UI documentation"""
+    def authenticate(self, request, token):
+        # This is just for OpenAPI docs - actual validation happens in endpoints
+        return token
+
+api = NinjaExtraAPI(
+    title="KnowledgeInjester API", 
+    version="0.1.0",
+    description="KnowledgeInjester API with JWT-based authentication. Get a token from POST /api/v1/sessions first."
+)
 
 # LLM client
 _llm = OpenAI()
@@ -720,67 +736,340 @@ class IngestController:
             return IngestOut(job_id=-1, docs=0, chunks=0, message=f"error: {e}")
 
 
-@api_controller("v1", tags=["conversations"])
-class ConversationController:
-    @http_post("/conversations", response=ConversationResponse)
-    @traceable(name="start_conversation", exclude_parameters=["request"])
-    def start_conversation(self, request):
+@api_controller("v1", tags=["sessions"])
+class SessionController:
+    @http_post("/sessions", response=SessionOut)
+    @traceable(name="create_session", exclude_parameters=["request"])
+    def create_session(self, request, payload: SessionIn):
         """
-        Start a new conversation with the AI assistant.
-        Returns a conversation_id that can be used for follow-up messages.
-        Handles both JSON and form-encoded request bodies.
+        Create a new JWT session token (Phase 1).
+        
+        Phase 1 Security:
+        - Validates siteKey and Origin
+        - Returns JWT token bound to the origin
+        - Token can be used for subsequent conversation requests
+        
+        Headers Required:
+        - Origin: https://... (required, must be HTTPS and in allowed_origins)
+        
+        Returns:
+        - JWT token with claims: {sid, tid, skey, org, env, iat, exp}
+        - Session metadata
         """
         request_id = str(uuid.uuid4())
         start_time = time.time()
         
-        try:
-            # Parse request data using our robust parser
-            payload = parse_request_data(request, ConversationStartIn)
-            
-            tenant_id = payload.tenant_id
-            enable_citations = payload.citations
-            user_message = payload.message.strip()
-            
-        except (ValueError, PydanticValidationError) as e:
-            logger.error("Validation error in start_conversation", extra={
-                'event_type': 'validation_error',
-                'request_id': request_id,
-                'error': str(e),
-                'content_type': request.content_type,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            duration_ms = (time.time() - start_time) * 1000
-            log_request_end("start_conversation", request_id, duration_ms, "validation_error")
-            return ConversationResponse(
-                text="",
-                role="assistant",
-                conversation_id="",
-                error=f"Invalid request data: {str(e)}"
-            )
+        site_key = payload.siteKey
+        origin = request.META.get('HTTP_ORIGIN', '')
+        ip_address = jwt_service.get_client_ip(request)
         
-        log_request_start("start_conversation", request_id, tenant_id=tenant_id, 
-                         enable_citations=enable_citations, 
-                         message_length=len(user_message))
+        log_request_start("create_session", request_id, site_key=site_key, origin=origin)
         
         try:
-            # Validate tenant_id exists in the database
-            try:
-                organization = Organization.objects.get(tenant_id=tenant_id)
-            except Organization.DoesNotExist:
-                logger.warning("Invalid tenant_id provided", extra={
-                    'event_type': 'invalid_tenant',
+            # 1. Validate Origin header (must be HTTPS, except localhost in development)
+            if not origin:
+                logger.warning("Missing Origin header in session request", extra={
+                    'event_type': 'missing_origin',
                     'request_id': request_id,
-                    'tenant_id': tenant_id,
+                    'site_key': site_key,
                     'timestamp': datetime.utcnow().isoformat()
                 })
                 duration_ms = (time.time() - start_time) * 1000
-                log_request_end("start_conversation", request_id, duration_ms, "invalid_tenant", tenant_id=tenant_id)
+                log_request_end("create_session", request_id, duration_ms, "missing_origin")
+                return JsonResponse({"error": "Origin header is required"}, status=403)
+            
+            # Allow HTTP for localhost/127.0.0.1 in development
+            is_localhost = any(host in origin for host in ['localhost', '127.0.0.1'])
+            if not origin.startswith('https://') and not (is_localhost and origin.startswith('http://')):
+                logger.warning("Non-HTTPS origin rejected", extra={
+                    'event_type': 'non_https_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id='unknown',
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'non_https_origin',
+                        'site_key': site_key
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "non_https_origin")
+                return JsonResponse({"error": "Only HTTPS origins are allowed"}, status=403)
+            
+            # 2. Look up Site by siteKey
+            try:
+                organization = Organization.objects.get(site_key=site_key, status='active')
+            except Organization.DoesNotExist:
+                logger.warning("Invalid or disabled site_key", extra={
+                    'event_type': 'invalid_site_key',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "invalid_site_key")
+                return JsonResponse({"error": "Invalid or disabled site key"}, status=404)
+            
+            # 3. Check if Origin is in allowed_origins
+            if not organization.is_origin_allowed(origin):
+                logger.warning("Origin not allowed for site", extra={
+                    'event_type': 'origin_not_allowed',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'allowed_origins': organization.allowed_origins,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id=organization.tenant_id,
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'origin_not_allowed',
+                        'site_key': site_key,
+                        'allowed_origins': organization.allowed_origins
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("create_session", request_id, duration_ms, "origin_not_allowed")
+                return JsonResponse({"error": "Origin not allowed for this site"}, status=403)
+            
+            # 4. Generate JWT token
+            token_data = jwt_service.generate_token(
+                tenant_id=organization.tenant_id,
+                site_key=site_key,
+                origin=origin,
+                env=organization.env
+            )
+            
+            # 5. Store session in database
+            from django.utils.dateparse import parse_datetime
+            session = Session.objects.create(
+                session_id=token_data['session_id'],
+                organization=organization,
+                tenant_id=organization.tenant_id,
+                site_key=site_key,
+                origin=origin,
+                ip_address=ip_address,
+                expires_at=parse_datetime(token_data['expires_at'])
+            )
+            
+            # 6. Audit session creation
+            ActivityAudit.objects.create(
+                tenant_id=organization.tenant_id,
+                site_key=site_key,
+                activity_type='session_created',
+                performed_by='system',
+                origin=origin,
+                ip_address=ip_address,
+                details={
+                    'session_id': token_data['session_id'],
+                    'expires_at': token_data['expires_at'],
+                    'page_url_hash': payload.pageUrlHash,
+                    'nonce': payload.nonce
+                }
+            )
+            
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("create_session", request_id, duration_ms, "success",
+                          tenant_id=organization.tenant_id, session_id=token_data['session_id'])
+            
+            log_business_metric("session_created", organization.tenant_id,
+                              site_key=site_key, origin=origin,
+                              session_id=token_data['session_id'])
+            
+            return SessionOut(
+                token=token_data['token'],
+                session_id=token_data['session_id'],
+                expires_in=token_data['expires_in'],
+                expires_at=token_data['expires_at']
+            )
+            
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("create_session", request_id, e, site_key=site_key)
+            log_request_end("create_session", request_id, duration_ms, "error")
+            return JsonResponse({"error": f"Error creating session: {str(e)}"}, status=500)
+
+
+@api_controller("v1", tags=["conversations"])
+class ConversationController:
+    @http_post("/conversations", response=ConversationResponse)
+    @traceable(name="start_conversation", exclude_parameters=["request"])
+    def start_conversation(self, request, payload: ConversationStartIn):
+        """
+        Start a new conversation with the AI assistant (Phase 0: siteKey + Origin).
+        
+        Phase 0 Security:
+        - Validates siteKey and Origin
+        - Creates conversation bound to origin
+        - Stores conversation in database for origin validation on continue
+        
+        Headers Required:
+        - Origin: https://... (required, must be HTTPS and in allowed_origins)
+        - Authorization: Bearer <token> (optional, JWT token from /sessions)
+        
+        Body:
+        - siteKey: Public site key
+        - message: User's first message
+        - citations: Optional, whether to include citations
+        - pageUrlHash: Optional telemetry
+        - nonce: Optional client nonce
+        
+        Returns:
+        - conversation_id: Unique conversation identifier
+        - Full response with answer and sources
+        """
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        origin = request.META.get('HTTP_ORIGIN', '')
+        ip_address = jwt_service.get_client_ip(request)
+        
+        # Extract data from payload (already parsed by Django Ninja)
+        site_key = payload.siteKey
+        enable_citations = payload.citations
+        user_message = payload.message.strip()
+        
+        # Validate message is not empty
+        if not user_message:
+            return ConversationResponse(
+                text="Message cannot be empty.",
+                role="assistant",
+                conversation_id="",
+                error="Empty message"
+            )
+        
+        log_request_start("start_conversation", request_id, site_key=site_key,
+                         origin=origin, enable_citations=enable_citations, 
+                         message_length=len(user_message))
+        
+        try:
+            # 1. Validate Origin header (must be HTTPS)
+            if not origin:
+                logger.warning("Missing Origin header in conversation request", extra={
+                    'event_type': 'missing_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "missing_origin")
                 return ConversationResponse(
-                    text="Invalid tenant ID. Please contact your administrator.",
+                    text="Origin header is required for security.",
                     role="assistant",
                     conversation_id="",
-                    error="Invalid tenant ID"
+                    error="Missing Origin header"
                 )
+            
+            # Allow HTTP for localhost/127.0.0.1 in development
+            is_localhost = any(host in origin for host in ['localhost', '127.0.0.1'])
+            if not origin.startswith('https://') and not (is_localhost and origin.startswith('http://')):
+                logger.warning("Non-HTTPS origin rejected", extra={
+                    'event_type': 'non_https_origin',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id='unknown',
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'non_https_origin',
+                        'endpoint': 'start_conversation'
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "non_https_origin")
+                return ConversationResponse(
+                    text="Only HTTPS origins are allowed for security.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Non-HTTPS origin"
+                )
+            
+            # 2. Look up Site by siteKey and validate status
+            try:
+                organization = Organization.objects.get(site_key=site_key, status='active')
+            except Organization.DoesNotExist:
+                logger.warning("Invalid or disabled site_key", extra={
+                    'event_type': 'invalid_site_key',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "invalid_site_key")
+                return ConversationResponse(
+                    text="Invalid or disabled site key. Please contact your administrator.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Invalid site key"
+                )
+            
+            # 3. Check if Origin is in allowed_origins
+            if not organization.is_origin_allowed(origin):
+                logger.warning("Origin not allowed for site", extra={
+                    'event_type': 'origin_not_allowed',
+                    'request_id': request_id,
+                    'site_key': site_key,
+                    'origin': origin,
+                    'allowed_origins': organization.allowed_origins,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked origin
+                ActivityAudit.objects.create(
+                    tenant_id=organization.tenant_id,
+                    site_key=site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'origin_not_allowed',
+                        'endpoint': 'start_conversation',
+                        'allowed_origins': organization.allowed_origins
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("start_conversation", request_id, duration_ms, "origin_not_allowed")
+                return ConversationResponse(
+                    text="Your domain is not authorized for this site. Please contact your administrator.",
+                    role="assistant",
+                    conversation_id="",
+                    error="Origin not allowed"
+                )
+            
+            tenant_id = organization.tenant_id
             
             # Validate user message
             if not user_message:
@@ -844,6 +1133,49 @@ class ConversationController:
                                  conversation_id=result.get("conversation_id"),
                                  answer_length=len(result.get("answer", "")))
             
+            # 4. Create Conversation record in database
+            conversation_id = result.get("conversation_id", "")
+            try:
+                conversation = Conversation.objects.create(
+                    conversation_id=conversation_id,
+                    organization=organization,
+                    tenant_id=tenant_id,
+                    site_key=site_key,
+                    origin=origin,
+                    ip_address=ip_address,
+                    page_url_hash=payload.pageUrlHash or "",
+                    nonce=payload.nonce or "",
+                    message_count=1,  # First message
+                    metadata={
+                        'user_agent': request.META.get('HTTP_USER_AGENT', ''),
+                        'referer': request.META.get('HTTP_REFERER', ''),
+                    }
+                )
+                
+                # Audit conversation creation
+                ActivityAudit.objects.create(
+                    tenant_id=tenant_id,
+                    site_key=site_key,
+                    activity_type='conversation_started',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'conversation_id': conversation_id,
+                        'page_url_hash': payload.pageUrlHash,
+                        'nonce': payload.nonce
+                    }
+                )
+            except Exception as db_error:
+                # Log but don't fail the request if DB insert fails
+                logger.error("Failed to create conversation record", extra={
+                    'event_type': 'conversation_db_error',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'error': str(db_error),
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+            
             # Convert sources to the expected format
             source_objects = None
             if result.get("sources") and enable_citations:
@@ -861,14 +1193,16 @@ class ConversationController:
             log_request_end("start_conversation", request_id, duration_ms, "success", 
                           tenant_id=tenant_id, answer_length=len(result.get("answer", "")),
                           sources_count=len(source_objects) if source_objects else 0,
-                          conversation_id=result.get("conversation_id"))
+                          conversation_id=conversation_id)
             
             log_business_metric("conversation_started", tenant_id, 
                               question_length=len(user_message),
                               answer_length=len(result.get("answer", "")),
                               sources_used=len(source_objects) if source_objects else 0,
                               citations_enabled=enable_citations,
-                              conversation_id=result.get("conversation_id"))
+                              conversation_id=conversation_id,
+                              site_key=site_key,
+                              origin=origin)
 
             # Return response with conversation ID
             return ConversationResponse(
@@ -891,66 +1225,199 @@ class ConversationController:
     
     @http_post("/conversations/{conversation_id}", response=ConversationResponse)
     @traceable(name="continue_conversation", exclude_parameters=["request"])
-    def continue_conversation(self, request, conversation_id: str):
+    def continue_conversation(self, request, conversation_id: str, payload: ConversationContinueIn):
         """
-        Continue an existing conversation by sending a new message.
-        The conversation_id should be obtained from a previous conversation response.
-        Handles both JSON and form-encoded request bodies.
+        Continue an existing conversation by sending a new message (Phase 0/1: Origin + JWT validation).
+        
+        Phase 0 Security:
+        - Validates Origin matches the stored conversation origin
+        - Derives tenant_id from conversation (no client-provided tenant_id)
+        
+        Phase 1 Security (Optional):
+        - Validates JWT token if provided in Authorization header
+        - Checks token origin matches request origin
+        
+        Headers Required:
+        - Origin: https://... (required, must match conversation origin)
+        - Authorization: Bearer <token> (optional for Phase 1)
+        
+        Body:
+        - message: User's message
+        - citations: Optional, whether to include citations
+        
+        Returns:
+        - Full response with answer and sources
         """
         request_id = str(uuid.uuid4())
         start_time = time.time()
         
-        try:
-            # Parse request data using our robust parser
-            payload = parse_request_data(request, ConversationContinueIn)
-            
-            tenant_id = payload.tenant_id
-            enable_citations = payload.citations
-            user_message = payload.message.strip()
-            
-        except (ValueError, PydanticValidationError) as e:
-            logger.error("Validation error in continue_conversation", extra={
-                'event_type': 'validation_error',
-                'request_id': request_id,
-                'conversation_id': conversation_id,
-                'error': str(e),
-                'content_type': request.content_type,
-                'timestamp': datetime.utcnow().isoformat()
-            })
-            duration_ms = (time.time() - start_time) * 1000
-            log_request_end("continue_conversation", request_id, duration_ms, "validation_error")
+        origin = request.META.get('HTTP_ORIGIN', '')
+        ip_address = jwt_service.get_client_ip(request)
+        authorization = request.META.get('HTTP_AUTHORIZATION', '')
+        
+        # Extract data from payload (already parsed by Django Ninja)
+        enable_citations = payload.citations
+        user_message = payload.message.strip()
+        
+        # Validate message is not empty
+        if not user_message:
             return ConversationResponse(
-                text="",
+                text="Message cannot be empty.",
                 role="assistant",
                 conversation_id=conversation_id,
-                error=f"Invalid request data: {str(e)}"
+                error="Empty message"
             )
         
-        log_request_start("continue_conversation", request_id, tenant_id=tenant_id, 
-                         enable_citations=enable_citations, 
-                         conversation_id=conversation_id,
-                         message_length=len(user_message))
+        log_request_start("continue_conversation", request_id, conversation_id=conversation_id,
+                         origin=origin, enable_citations=enable_citations, 
+                         message_length=len(user_message), has_token=bool(authorization))
         
         try:
-            # Validate tenant_id exists in the database
-            try:
-                organization = Organization.objects.get(tenant_id=tenant_id)
-            except Organization.DoesNotExist:
-                logger.warning("Invalid tenant_id provided", extra={
-                    'event_type': 'invalid_tenant',
+            # 1. Validate Origin header (must be HTTPS)
+            if not origin:
+                logger.warning("Missing Origin header in continue conversation", extra={
+                    'event_type': 'missing_origin',
                     'request_id': request_id,
-                    'tenant_id': tenant_id,
                     'conversation_id': conversation_id,
                     'timestamp': datetime.utcnow().isoformat()
                 })
                 duration_ms = (time.time() - start_time) * 1000
-                log_request_end("continue_conversation", request_id, duration_ms, "invalid_tenant", tenant_id=tenant_id)
+                log_request_end("continue_conversation", request_id, duration_ms, "missing_origin")
                 return ConversationResponse(
-                    text="Invalid tenant ID. Please contact your administrator.",
+                    text="Origin header is required for security.",
                     role="assistant",
                     conversation_id=conversation_id,
-                    error="Invalid tenant ID"
+                    error="Missing Origin header"
                 )
+            
+            # Allow HTTP for localhost/127.0.0.1 in development
+            is_localhost = any(host in origin for host in ['localhost', '127.0.0.1'])
+            if not origin.startswith('https://') and not (is_localhost and origin.startswith('http://')):
+                logger.warning("Non-HTTPS origin rejected", extra={
+                    'event_type': 'non_https_origin',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "non_https_origin")
+                return ConversationResponse(
+                    text="Only HTTPS origins are allowed for security.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Non-HTTPS origin"
+                )
+            
+            # 2. Load Conversation from database
+            try:
+                conversation = Conversation.objects.get(conversation_id=conversation_id)
+            except Conversation.DoesNotExist:
+                logger.warning("Conversation not found in database", extra={
+                    'event_type': 'conversation_not_found',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'origin': origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "conversation_not_found")
+                return ConversationResponse(
+                    text="Conversation not found. Please start a new conversation.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Conversation not found"
+                )
+            
+            # 3. Enforce Origin === conversation.origin (strict security)
+            if origin != conversation.origin:
+                logger.warning("Origin mismatch in continue conversation", extra={
+                    'event_type': 'origin_mismatch',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'request_origin': origin,
+                    'conversation_origin': conversation.origin,
+                    'timestamp': datetime.utcnow().isoformat()
+                })
+                
+                # Audit the blocked request
+                ActivityAudit.objects.create(
+                    tenant_id=conversation.tenant_id,
+                    site_key=conversation.site_key,
+                    activity_type='origin_blocked',
+                    performed_by='system',
+                    origin=origin,
+                    ip_address=ip_address,
+                    details={
+                        'reason': 'origin_mismatch',
+                        'endpoint': 'continue_conversation',
+                        'conversation_id': conversation_id,
+                        'expected_origin': conversation.origin
+                    }
+                )
+                
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("continue_conversation", request_id, duration_ms, "origin_mismatch")
+                return ConversationResponse(
+                    text="Origin mismatch. This conversation is bound to a different origin.",
+                    role="assistant",
+                    conversation_id=conversation_id,
+                    error="Origin mismatch"
+                )
+            
+            # 4. Phase 1: Validate JWT token if provided (optional)
+            if authorization:
+                token = jwt_service.extract_bearer_token(authorization)
+                if token:
+                    try:
+                        payload = jwt_service.verify_token(token, expected_origin=origin)
+                        
+                        # Verify token site_key matches conversation site_key
+                        if payload.get('skey') != conversation.site_key:
+                            logger.warning("Token site_key mismatch", extra={
+                                'event_type': 'token_site_key_mismatch',
+                                'request_id': request_id,
+                                'conversation_id': conversation_id,
+                                'token_site_key': payload.get('skey'),
+                                'conversation_site_key': conversation.site_key,
+                                'timestamp': datetime.utcnow().isoformat()
+                            })
+                            duration_ms = (time.time() - start_time) * 1000
+                            log_request_end("continue_conversation", request_id, duration_ms, "token_site_key_mismatch")
+                            return ConversationResponse(
+                                text="Token does not match conversation.",
+                                role="assistant",
+                                conversation_id=conversation_id,
+                                error="Token mismatch"
+                            )
+                        
+                        # Update session usage
+                        try:
+                            session = Session.objects.get(session_id=payload.get('sid'))
+                            session.request_count += 1
+                            session.save(update_fields=['request_count', 'last_used_at'])
+                        except Session.DoesNotExist:
+                            pass  # Session might be expired or deleted
+                        
+                    except Exception as jwt_error:
+                        logger.warning("JWT validation failed", extra={
+                            'event_type': 'jwt_validation_failed',
+                            'request_id': request_id,
+                            'conversation_id': conversation_id,
+                            'error': str(jwt_error),
+                            'timestamp': datetime.utcnow().isoformat()
+                        })
+                        duration_ms = (time.time() - start_time) * 1000
+                        log_request_end("continue_conversation", request_id, duration_ms, "jwt_invalid")
+                        return ConversationResponse(
+                            text="Invalid or expired token.",
+                            role="assistant",
+                            conversation_id=conversation_id,
+                            error="Invalid token"
+                        )
+            
+            # Derive tenant_id from conversation (never trust client)
+            tenant_id = conversation.tenant_id
             
             # Validate user message
             if not user_message:
@@ -962,32 +1429,29 @@ class ConversationController:
                     error="User message cannot be empty."
                 )
             
-            # Check if conversation exists
-            conversation = conversation_storage.get_conversation(conversation_id, tenant_id)
-            if conversation is None:
-                logger.warning("Conversation not found", extra={
-                    'event_type': 'conversation_not_found',
+            # Check if conversation exists in in-memory storage
+            conversation_storage_data = conversation_storage.get_conversation(conversation_id, tenant_id)
+            if conversation_storage_data is None:
+                logger.warning("Conversation not found in storage", extra={
+                    'event_type': 'conversation_not_in_storage',
                     'request_id': request_id,
                     'tenant_id': tenant_id,
                     'conversation_id': conversation_id,
                     'timestamp': datetime.utcnow().isoformat()
                 })
-                return ConversationResponse(
-                    text="Conversation not found. Please start a new conversation.",
-                    role="assistant",
-                    conversation_id=conversation_id,
-                    error="Conversation not found"
-                )
+                # Note: Conversation exists in DB but not in cache, this is OK
+                # The conversation_pipeline will handle this
             
             logger.info("Continue conversation request details", extra={
                 'event_type': 'continue_conversation_details',
                 'request_id': request_id,
                 'tenant_id': tenant_id,
+                'site_key': conversation.site_key,
                 'conversation_id': conversation_id,
                 'message_length': len(user_message),
                 'message_preview': user_message[:100] + "..." if len(user_message) > 100 else user_message,
                 'enable_citations': enable_citations,
-                'existing_messages': len(conversation.messages),
+                'existing_messages': conversation_storage_data.messages if conversation_storage_data else 0,
                 'timestamp': datetime.utcnow().isoformat()
             })
 
@@ -1033,6 +1497,19 @@ class ConversationController:
             log_performance_metric("conversation_pipeline", pipeline_duration, tenant_id=tenant_id,
                                  conversation_id=result.get("conversation_id"),
                                  answer_length=len(result.get("answer", "")))
+            
+            # 5. Update message count in Conversation model
+            try:
+                conversation.message_count += 1
+                conversation.save(update_fields=['message_count', 'last_seen_at'])
+            except Exception as db_error:
+                logger.error("Failed to update conversation message count", extra={
+                    'event_type': 'conversation_update_error',
+                    'request_id': request_id,
+                    'conversation_id': conversation_id,
+                    'error': str(db_error),
+                    'timestamp': datetime.utcnow().isoformat()
+                })
             
             # Convert sources to the expected format
             source_objects = None
@@ -1177,4 +1654,4 @@ class ConversationController:
             logger.error(f"Error getting conversation stats: {str(e)}")
             return {"error": f"Error getting conversation stats: {str(e)}"}
 
-api.register_controllers(MetaController, AskController, IngestController, AdminController, ConversationController)
+api.register_controllers(MetaController, AskController, IngestController, AdminController, SessionController, ConversationController)
