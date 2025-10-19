@@ -264,6 +264,52 @@ class ConversationStorageService:
             "cache_timeout": self.cache_timeout,
             "max_entries": self.max_entries
         }
+    
+    def get_all_tenants_with_conversations(self) -> List[str]:
+        """Get list of all tenant_ids that have conversations in cache"""
+        from apps.tenants.models import Organization
+        
+        # Get all tenant_ids from organizations
+        all_tenant_ids = Organization.objects.values_list('tenant_id', flat=True)
+        
+        # Filter to only those with cached conversations
+        tenants_with_convs = []
+        for tenant_id in all_tenant_ids:
+            tenant_key = self._get_tenant_conversations_key(tenant_id)
+            conversation_ids = self.cache.get(tenant_key, [])
+            if conversation_ids:
+                tenants_with_convs.append(tenant_id)
+        
+        logger.debug("Found tenants with conversations", extra={
+            'total_tenants': len(tenants_with_convs)
+        })
+        
+        return tenants_with_convs
+    
+    def get_all_conversations_by_tenant(
+        self, 
+        tenant_ids: List[str], 
+        conv_limit: int = 10, 
+        conv_offset: int = 0
+    ) -> Dict[str, List[ConversationData]]:
+        """Get conversations for multiple tenants with pagination"""
+        result = {}
+        
+        for tenant_id in tenant_ids:
+            conversations = self.list_tenant_conversations(
+                tenant_id, 
+                limit=conv_limit, 
+                offset=conv_offset
+            )
+            result[tenant_id] = conversations
+        
+        logger.debug("Retrieved conversations for multiple tenants", extra={
+            'tenant_count': len(tenant_ids),
+            'conv_limit': conv_limit,
+            'conv_offset': conv_offset
+        })
+        
+        return result
 
 # Global instance
 conversation_storage = ConversationStorageService()
