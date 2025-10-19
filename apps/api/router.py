@@ -77,15 +77,6 @@ from apps.vectorizer.embedder import embed_texts
 from apps.vectorizer.supabase_store import hybrid_search, get_tenant_stats, cleanup_tenant_data
 from openai import OpenAI
 
-# LangSmith tracing
-try:
-    from langsmith import traceable
-    LANGSMITH_AVAILABLE = True
-except ImportError:
-    LANGSMITH_AVAILABLE = False
-    def traceable(func):
-        return func
-
 # Activity audit
 from apps.tenants.models import ActivityAudit, Organization, Conversation, Session
 
@@ -699,7 +690,6 @@ def process_citations(hits, answer, enable_citations=True):
 @api_controller("v1", tags=["ask"])
 class AskController:
     @http_post("/ask", response=AskOut)
-    @traceable(name="ask_endpoint", exclude_parameters=["request"])
     def ask(self, request, payload: AskIn):
         """
         Enhanced ask endpoint with server-side conversation history support.
@@ -974,7 +964,6 @@ class IngestController:
 @api_controller("v1", tags=["sessions"])
 class SessionController:
     @http_post("/sessions", response=SessionOut)
-    @traceable(name="create_session", exclude_parameters=["request"])
     def create_session(self, request, payload: SessionIn):
         """
         Create a new JWT session token (Phase 1).
@@ -1148,7 +1137,6 @@ class SessionController:
 @api_controller("v1", tags=["conversations"])
 class ConversationController:
     @http_post("/conversations", response=ConversationResponse)
-    @traceable(name="start_conversation", exclude_parameters=["request"])
     def start_conversation(self, request, payload: ConversationStartIn):
         """
         Start a new conversation with the AI assistant (Phase 0: siteKey + Origin).
@@ -1459,7 +1447,6 @@ class ConversationController:
             )
     
     @http_post("/conversations/{conversation_id}", response=ConversationResponse)
-    @traceable(name="continue_conversation", exclude_parameters=["request"])
     def continue_conversation(self, request, conversation_id: str, payload: ConversationContinueIn):
         """
         Continue an existing conversation by sending a new message (Phase 0/1: Origin + JWT validation).
