@@ -38,6 +38,33 @@ class TenantStatsOut(BaseModel):
     total_size: str
     total_bytes: int
 
+class ConversationMetadataOut(BaseModel):
+    conversation_id: str
+    tenant_id: str
+    created_at: float
+    last_activity: float
+    message_count: int
+    metadata: Dict[str, Any]
+
+class TenantConversationsOut(BaseModel):
+    tenant_id: str
+    organization_name: str | None = None
+    conversations: list[ConversationMetadataOut]
+    total_conversations: int
+
+class AllConversationsOut(BaseModel):
+    tenants: list[TenantConversationsOut]
+    total_tenants: int
+    pagination: Dict[str, Any]
+
+class ConversationDetailOut(BaseModel):
+    conversation_id: str
+    tenant_id: str
+    created_at: float
+    last_activity: float
+    messages: list[Dict[str, Any]]
+    metadata: Dict[str, Any]
+
 # LangGraph (our crawl→extract→vectorize graph)
 from apps.pipelines.langgraph.graph import build_graph
 from apps.pipelines.schemas import PipelineState
@@ -49,15 +76,6 @@ from apps.vectorizer.tasks import ingest_task
 from apps.vectorizer.embedder import embed_texts
 from apps.vectorizer.supabase_store import hybrid_search, get_tenant_stats, cleanup_tenant_data
 from openai import OpenAI
-
-# LangSmith tracing
-try:
-    from langsmith import traceable
-    LANGSMITH_AVAILABLE = True
-except ImportError:
-    LANGSMITH_AVAILABLE = False
-    def traceable(func):
-        return func
 
 # Activity audit
 from apps.tenants.models import ActivityAudit, Organization, Conversation, Session
@@ -383,6 +401,214 @@ class AdminController:
             log_request_end("cleanup_tenant", request_id, duration_ms, "error", 
                           tenant_id=tenant_id)
             return {"error": f"Failed to cleanup: {str(e)}"}
+    
+    @http_get("/admin/conversations", response=AllConversationsOut)
+    def list_all_conversations(
+        self, 
+        request, 
+        org_limit: int = 10, 
+        org_offset: int = 0,
+        conv_limit: int = 10,
+        conv_offset: int = 0
+    ):
+        """List all conversations across all tenants/organizations with pagination."""
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        log_request_start("list_all_conversations", request_id, 
+                         org_limit=org_limit, org_offset=org_offset,
+                         conv_limit=conv_limit, conv_offset=conv_offset)
+        
+        try:
+            # Get all tenant_ids that have conversations
+            all_tenant_ids = conversation_storage.get_all_tenants_with_conversations()
+            total_tenants = len(all_tenant_ids)
+            
+            # Apply organization-level pagination
+            paginated_tenant_ids = all_tenant_ids[org_offset:org_offset + org_limit]
+            
+            # Get conversations for each tenant
+            conversations_by_tenant = conversation_storage.get_all_conversations_by_tenant(
+                paginated_tenant_ids,
+                conv_limit=conv_limit,
+                conv_offset=conv_offset
+            )
+            
+            # Build response with organization names
+            tenants_data = []
+            for tenant_id in paginated_tenant_ids:
+                # Get organization name
+                try:
+                    org = Organization.objects.get(tenant_id=tenant_id)
+                    org_name = org.name
+                except Organization.DoesNotExist:
+                    org_name = None
+                
+                conversations = conversations_by_tenant.get(tenant_id, [])
+                
+                # Get total count for this tenant
+                tenant_key = conversation_storage._get_tenant_conversations_key(tenant_id)
+                all_conv_ids = conversation_storage.cache.get(tenant_key, [])
+                total_convs = len(all_conv_ids)
+                
+                # Build conversation metadata
+                conv_metadata = [
+                    ConversationMetadataOut(
+                        conversation_id=conv.conversation_id,
+                        tenant_id=conv.tenant_id,
+                        created_at=conv.created_at,
+                        last_activity=conv.last_activity,
+                        message_count=len(conv.messages),
+                        metadata=conv.metadata
+                    )
+                    for conv in conversations
+                ]
+                
+                tenants_data.append(TenantConversationsOut(
+                    tenant_id=tenant_id,
+                    organization_name=org_name,
+                    conversations=conv_metadata,
+                    total_conversations=total_convs
+                ))
+            
+            result = AllConversationsOut(
+                tenants=tenants_data,
+                total_tenants=total_tenants,
+                pagination={
+                    "org_offset": org_offset,
+                    "org_limit": org_limit,
+                    "conv_offset": conv_offset,
+                    "conv_limit": conv_limit,
+                    "has_more_orgs": (org_offset + org_limit) < total_tenants
+                }
+            )
+            
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("list_all_conversations", request_id, duration_ms, "success",
+                          total_tenants=total_tenants, 
+                          returned_tenants=len(tenants_data))
+            
+            return result
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("list_all_conversations", request_id, e)
+            log_request_end("list_all_conversations", request_id, duration_ms, "error")
+            return {"error": f"Failed to list conversations: {str(e)}"}
+    
+    @http_get("/admin/conversations/{tenant_id}", response=TenantConversationsOut)
+    def list_tenant_conversations(
+        self,
+        request,
+        tenant_id: str,
+        limit: int = 20,
+        offset: int = 0
+    ):
+        """List all conversations for a specific tenant with pagination."""
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        log_request_start("list_tenant_conversations", request_id,
+                         tenant_id=tenant_id, limit=limit, offset=offset)
+        
+        try:
+            # Get organization name
+            try:
+                org = Organization.objects.get(tenant_id=tenant_id)
+                org_name = org.name
+            except Organization.DoesNotExist:
+                org_name = None
+            
+            # Get conversations
+            conversations = conversation_storage.list_tenant_conversations(
+                tenant_id,
+                limit=limit,
+                offset=offset
+            )
+            
+            # Get total count
+            tenant_key = conversation_storage._get_tenant_conversations_key(tenant_id)
+            all_conv_ids = conversation_storage.cache.get(tenant_key, [])
+            total_convs = len(all_conv_ids)
+            
+            # Build conversation metadata
+            conv_metadata = [
+                ConversationMetadataOut(
+                    conversation_id=conv.conversation_id,
+                    tenant_id=conv.tenant_id,
+                    created_at=conv.created_at,
+                    last_activity=conv.last_activity,
+                    message_count=len(conv.messages),
+                    metadata=conv.metadata
+                )
+                for conv in conversations
+            ]
+            
+            result = TenantConversationsOut(
+                tenant_id=tenant_id,
+                organization_name=org_name,
+                conversations=conv_metadata,
+                total_conversations=total_convs
+            )
+            
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("list_tenant_conversations", request_id, duration_ms, "success",
+                          tenant_id=tenant_id, conversation_count=len(conv_metadata))
+            
+            return result
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("list_tenant_conversations", request_id, e, tenant_id=tenant_id)
+            log_request_end("list_tenant_conversations", request_id, duration_ms, "error",
+                          tenant_id=tenant_id)
+            return {"error": f"Failed to list tenant conversations: {str(e)}"}
+    
+    @http_get("/admin/conversations/{tenant_id}/{conversation_id}/details", response=ConversationDetailOut)
+    def get_conversation_details(
+        self,
+        request,
+        tenant_id: str,
+        conversation_id: str
+    ):
+        """Get full conversation details including all messages."""
+        request_id = str(uuid.uuid4())
+        start_time = time.time()
+        
+        log_request_start("get_conversation_details", request_id,
+                         tenant_id=tenant_id, conversation_id=conversation_id)
+        
+        try:
+            # Get conversation
+            conversation = conversation_storage.get_conversation(conversation_id, tenant_id)
+            
+            if conversation is None:
+                duration_ms = (time.time() - start_time) * 1000
+                log_request_end("get_conversation_details", request_id, duration_ms, "not_found",
+                              tenant_id=tenant_id, conversation_id=conversation_id)
+                return {"error": "Conversation not found"}
+            
+            # Build detailed response
+            result = ConversationDetailOut(
+                conversation_id=conversation.conversation_id,
+                tenant_id=conversation.tenant_id,
+                created_at=conversation.created_at,
+                last_activity=conversation.last_activity,
+                messages=[msg.to_dict() for msg in conversation.messages],
+                metadata=conversation.metadata
+            )
+            
+            duration_ms = (time.time() - start_time) * 1000
+            log_request_end("get_conversation_details", request_id, duration_ms, "success",
+                          tenant_id=tenant_id, conversation_id=conversation_id,
+                          message_count=len(conversation.messages))
+            
+            return result
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            log_error("get_conversation_details", request_id, e,
+                     tenant_id=tenant_id, conversation_id=conversation_id)
+            log_request_end("get_conversation_details", request_id, duration_ms, "error",
+                          tenant_id=tenant_id, conversation_id=conversation_id)
+            return {"error": f"Failed to get conversation details: {str(e)}"}
 
 def process_citations(hits, answer, enable_citations=True):
     """
@@ -464,7 +690,6 @@ def process_citations(hits, answer, enable_citations=True):
 @api_controller("v1", tags=["ask"])
 class AskController:
     @http_post("/ask", response=AskOut)
-    @traceable(name="ask_endpoint", exclude_parameters=["request"])
     def ask(self, request, payload: AskIn):
         """
         Enhanced ask endpoint with server-side conversation history support.
@@ -739,7 +964,6 @@ class IngestController:
 @api_controller("v1", tags=["sessions"])
 class SessionController:
     @http_post("/sessions", response=SessionOut)
-    @traceable(name="create_session", exclude_parameters=["request"])
     def create_session(self, request, payload: SessionIn):
         """
         Create a new JWT session token (Phase 1).
@@ -913,7 +1137,6 @@ class SessionController:
 @api_controller("v1", tags=["conversations"])
 class ConversationController:
     @http_post("/conversations", response=ConversationResponse)
-    @traceable(name="start_conversation", exclude_parameters=["request"])
     def start_conversation(self, request, payload: ConversationStartIn):
         """
         Start a new conversation with the AI assistant (Phase 0: siteKey + Origin).
@@ -1224,7 +1447,6 @@ class ConversationController:
             )
     
     @http_post("/conversations/{conversation_id}", response=ConversationResponse)
-    @traceable(name="continue_conversation", exclude_parameters=["request"])
     def continue_conversation(self, request, conversation_id: str, payload: ConversationContinueIn):
         """
         Continue an existing conversation by sending a new message (Phase 0/1: Origin + JWT validation).
